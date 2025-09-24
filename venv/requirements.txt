@@ -1,0 +1,15 @@
+PySide6>=6.5.0
+PyInstaller>=5.13.0
+
+# 動画ダイジェスト機能用（オプショナル）
+# 動画ダイジェスト機能を使用する場合は以下のコマンドを実行してください:
+# pip install opencv-python numpy
+# opencv-python>=4.8.0
+# numpy>=1.24.0
+
+# ゴミ箱機能用（オプショナル）
+# ゴミ箱機能を使用する場合は以下のコマンドを実行してください:
+# Windows: pip install winshell
+# macOS/Linux: pip install send2trash
+# winshell>=1.0.228
+# send2trash>=1.8.2

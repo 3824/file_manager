@@ -1,0 +1,13 @@
+---
+description: pytestとpytest-qtを使用したテスト開発の規約。
+globs: ["tests/**/*.py"]
+---
+
+# pytest テスト規約
+
+- テストファイルは`tests`ディレクトリに配置し、`test_*.py`または`*_test.py`の命名規則に従う。
+- テスト関数は`test_*`のプレフィックスを付ける。
+- **`pytest-qt`の`qtbot`フィクスチャ**を使用して、GUIのシミュレーションとテストを行う。
+- `qtbot.mouseClick`や`qtbot.keyClicks`を使用して、UI操作をシミュレートする。
+- `qtbot.addWidget`を使用して、テスト対象のウィジェットを管理する。
+- GUIコンポーネントのテストは、ユーザーの操作シナリオを忠実に再現する。
