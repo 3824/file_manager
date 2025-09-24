@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sudo apt install:*)",
+      "Bash(source:*)",
+      "Bash(python -m pip:*)",
+      "Bash(git checkout:*)",
+      "Bash(python3:*)",
+      "Bash(fc-list:*)",
+      "Bash(git add:*)",
+      "Bash(git push:*)",
+      "Bash(python file_manager.py)",
+      "Bash(pip install:*)",
+      "Bash(python:*)",
+      "Bash(sudo apt:*)",
+      "Bash(apt list:*)",
+      "Bash(ldconfig:*)",
+      "Bash(wget:*)",
+      "Bash(export PATH=$PATH:~/.local/bin)",
+      "Bash(export DISPLAY=:0.0)"
+    ],
+    "deny": []
+  }
+}

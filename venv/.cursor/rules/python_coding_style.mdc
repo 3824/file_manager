@@ -1,0 +1,13 @@
+---
+description: PythonのPEP8準拠のコーディング規約。
+globs: ["**/*.py"]
+alwaysApply: true
+---
+
+# Python コーディングスタイル
+
+- 変数、関数、メソッド名は**snake_case**を使用する。
+- クラス名は**PascalCase**を使用する。
+- docstringsはすべてのクラスと関数に記述し、Sphinxスタイルを推奨する。
+- 1行の長さは88文字を超えないようにする（Blackのデフォルト設定）。
+- タイプヒントを積極的に使用し、可読性と静的解析を向上させる。
