@@ -58,6 +58,22 @@ except ImportError:
     VIDEO_DUPLICATES_AVAILABLE = False
     VideoDuplicatesDialog = None  # type: ignore[assignment]
 
+# ファイル名類似度検出関連のインポート
+try:
+    from .filename_similarity_dialog import FilenameSimilarityDialog
+    FILENAME_SIMILARITY_AVAILABLE = True
+except ImportError:
+    FILENAME_SIMILARITY_AVAILABLE = False
+    FilenameSimilarityDialog = None  # type: ignore[assignment]
+
+# 同じファイルサイズ検出関連のインポート
+try:
+    from .same_filesize_dialog import SameFileSizeDialog
+    SAME_FILESIZE_AVAILABLE = True
+except ImportError:
+    SAME_FILESIZE_AVAILABLE = False
+    SameFileSizeDialog = None  # type: ignore[assignment]
+
 class CustomFileSystemModel(QFileSystemModel):
     """カスタムファイルシステムモデル（追加列対応・チェックボックス選択機能付き）"""
     
@@ -1046,6 +1062,21 @@ class FileManagerWidget(QWidget):
         self.duplicate_videos_button.clicked.connect(self.show_duplicate_videos_dialog)
         self.duplicate_videos_button.setEnabled(VIDEO_DUPLICATES_AVAILABLE)
         self.toolbar.addWidget(self.duplicate_videos_button)
+
+        # ファイル名類似度検出ボタン
+        self.filename_similarity_button = QPushButton("類似ファイル名")
+        self.filename_similarity_button.setToolTip("選択中フォルダ内のファイル名が類似したファイルを検出")
+        self.filename_similarity_button.clicked.connect(self.show_filename_similarity_dialog)
+        self.filename_similarity_button.setEnabled(FILENAME_SIMILARITY_AVAILABLE)
+        self.toolbar.addWidget(self.filename_similarity_button)
+
+        # 同じファイルサイズ検出ボタン
+        self.same_filesize_button = QPushButton("同サイズ")
+        self.same_filesize_button.setToolTip("選択中フォルダ内の同じファイルサイズのファイルを検出")
+        self.same_filesize_button.clicked.connect(self.show_same_filesize_dialog)
+        self.same_filesize_button.setEnabled(SAME_FILESIZE_AVAILABLE)
+        self.toolbar.addWidget(self.same_filesize_button)
+
         # 選択したファイルをゴミ箱に移動ボタン
         self.move_to_trash_button = QPushButton("🗑️")
         self.move_to_trash_button.setToolTip("選択したファイルをゴミ箱に移動")
@@ -1314,6 +1345,52 @@ class FileManagerWidget(QWidget):
                 "重複動画の表示中にエラーが発生しました:\n{0}".format(error),
             )
 
+    def show_filename_similarity_dialog(self, target_path=None):
+        """選択中フォルダ内のファイル名が類似したファイルを表示"""
+        if not bool(FilenameSimilarityDialog):
+            QMessageBox.warning(self, "エラー", "ファイル名類似度検出機能を利用できません。")
+            return
+
+        if isinstance(target_path, bool) or target_path is None:
+            target_path = self.current_path
+
+        if not target_path or not os.path.isdir(target_path):
+            QMessageBox.information(self, "情報", "フォルダを選択してください。")
+            return
+
+        try:
+            dialog = FilenameSimilarityDialog(target_path, self)
+            dialog.exec()
+        except Exception as error:
+            QMessageBox.warning(
+                self,
+                "エラー",
+                "ファイル名類似度検出中にエラーが発生しました:\n{0}".format(error),
+            )
+
+    def show_same_filesize_dialog(self, target_path=None):
+        """選択中フォルダ内の同じファイルサイズのファイルを表示"""
+        if not bool(SameFileSizeDialog):
+            QMessageBox.warning(self, "エラー", "同じファイルサイズ検出機能を利用できません。")
+            return
+
+        if isinstance(target_path, bool) or target_path is None:
+            target_path = self.current_path
+
+        if not target_path or not os.path.isdir(target_path):
+            QMessageBox.information(self, "情報", "フォルダを選択してください。")
+            return
+
+        try:
+            dialog = SameFileSizeDialog(self, target_path)
+            dialog.exec()
+        except Exception as error:
+            QMessageBox.warning(
+                self,
+                "エラー",
+                "同じファイルサイズ検出中にエラーが発生しました:\n{0}".format(error),
+            )
+
     def show_disk_analysis_dialog(self):
         """ディスク分析ダイアログを表示（呼び出し時にモジュールをロード）"""
         try:
@@ -1463,6 +1540,13 @@ class FileManagerWidget(QWidget):
             duplicate_action = QAction("重複動画を検出", self)
             duplicate_action.triggered.connect(lambda: self.show_duplicate_videos_dialog(folder_path))
             menu.addAction(duplicate_action)
+
+        if bool(FilenameSimilarityDialog) and folder_path:
+            similarity_action = QAction("類似ファイル名を検出", self)
+            similarity_action.triggered.connect(lambda: self.show_filename_similarity_dialog(folder_path))
+            menu.addAction(similarity_action)
+
+        if (bool(VideoDuplicatesDialog) or bool(FilenameSimilarityDialog)) and folder_path:
             menu.addSeparator()
 
         # ディスク解析
