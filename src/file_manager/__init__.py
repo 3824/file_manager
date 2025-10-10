@@ -11,6 +11,8 @@ from .video_digest_dialog import VideoDigestDialog
 from .video_duplicates import DuplicateGroup, find_duplicate_videos
 from .video_duplicates_dialog import VideoDuplicatesDialog
 from .video_thumbnail_preview import VideoThumbnailPreview
+from .filename_similarity import SimilarFileGroup, find_similar_filenames
+from .filename_similarity_dialog import FilenameSimilarityDialog
 
 # パッケージ直下で main モジュールを読み込み、run スクリプト等から参照できるようにする
 main = main_module
@@ -33,6 +35,9 @@ __all__ = [
     "VideoDuplicatesDialog",
     "find_duplicate_videos",
     "DuplicateGroup",
+    "FilenameSimilarityDialog",
+    "find_similar_filenames",
+    "SimilarFileGroup",
 ]
 
 

@@ -18,7 +18,8 @@
       "Bash(wget:*)",
       "Bash(export PATH=$PATH:~/.local/bin)",
       "Bash(export DISPLAY=:0.0)",
-      "mcp__codex__codex"
+      "mcp__codex__codex",
+      "Bash(timeout:*)"
     ],
     "deny": []
   },
