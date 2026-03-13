@@ -19,10 +19,15 @@
       "Bash(export PATH=$PATH:~/.local/bin)",
       "Bash(export DISPLAY=:0.0)",
       "mcp__codex__codex",
-      "Bash(timeout:*)"
+      "Bash(timeout:*)",
+      "Bash(ls -lh /g/project/file_manager/src/file_manager/*.py)",
+      "WebSearch",
+      "Bash(wc:*)",
+      "Bash(ls -la /g/project/file_manager/src/file_manager/*.py | head -20)"
     ],
     "deny": []
   },
+  "enableAllProjectMcpServers": true,
   "enabledMcpjsonServers": [
     "codex"
   ]

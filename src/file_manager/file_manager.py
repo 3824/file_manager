@@ -20,14 +20,14 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import (
     Qt, QDir, QModelIndex, Signal, QSortFilterProxyModel, QTimer,
-    QSettings, QFileInfo, QAbstractItemModel
+    QSettings, QFileInfo, QAbstractItemModel, QObject
 )
 from PySide6.QtGui import QAction, QKeySequence, QIcon, QFont, QColor, QPalette
 
 # 動画ダイジェスト関連のインポート
 try:
-    from video_digest import VideoDigestGenerator, OPENCV_AVAILABLE
-    from video_digest_dialog import VideoDigestDialog
+    from .video_digest import VideoDigestGenerator, OPENCV_AVAILABLE
+    from .video_digest_dialog import VideoDigestDialog
     VIDEO_DIGEST_AVAILABLE = True
 except ImportError:
     VIDEO_DIGEST_AVAILABLE = False
@@ -39,13 +39,13 @@ from .video_thumbnail_preview import VideoThumbnailPreview
 
 # ファイル検索関連のインポート
 try:
-    from file_search_dialog import FileSearchDialog
+    from .file_search_dialog import FileSearchDialog
     FILE_SEARCH_AVAILABLE = True
 except ImportError:
     FILE_SEARCH_AVAILABLE = False
 # ディスク分析関連のインポート
 try:
-    from disk_analysis_dialog import DiskAnalysisDialog
+    from .disk_analysis_dialog import DiskAnalysisDialog
     DISK_ANALYSIS_AVAILABLE = True
 except ImportError:
     DISK_ANALYSIS_AVAILABLE = False
@@ -77,6 +77,8 @@ except ImportError:
 class CustomFileSystemModel(QFileSystemModel):
     """カスタムファイルシステムモデル（追加列対応・チェックボックス選択機能付き）"""
     
+    metadata_fetch_requested = Signal(str) # パス
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.visible_columns = {
@@ -89,20 +91,26 @@ class CustomFileSystemModel(QFileSystemModel):
             "attributes": False,
             "extension": False,
             "owner": False,
-            "group": False
+            "group": False,
+            "duration": True,
+            "resolution": True,
+            "fps": False
         }
         self.selected_files = set()  # 選択されたファイルのパスを管理
+        self.metadata_cache = {}
+        self.metadata_loading = set()
     
     def columnCount(self, parent=QModelIndex()):
         """列数を返す"""
-        return 10  # 名前、サイズ、種類、更新日時、権限、作成日時、属性、拡張子、所有者、グループ
+        return 13  # 名前、サイズ、種類、更新日時、権限、作成日時、属性、拡張子、所有者、グループ, 再生時間, 解像度, FPS
     
     def headerData(self, section, orientation, role=Qt.DisplayRole):
         """ヘッダーデータを返す"""
         if orientation == Qt.Horizontal and role == Qt.DisplayRole:
             headers = [
                 "名前", "サイズ", "種類", "更新日時", "権限", 
-                "作成日時", "属性", "拡張子", "所有者", "グループ"
+                "作成日時", "属性", "拡張子", "所有者", "グループ",
+                "再生時間", "解像度", "FPS"
             ]
             if 0 <= section < len(headers):
                 return headers[section]
@@ -147,6 +155,24 @@ class CustomFileSystemModel(QFileSystemModel):
                 return self.get_owner(file_info)
             elif column == 9:  # グループ
                 return self.get_group(file_info)
+            elif column == 10: # 再生時間
+                meta = self.get_video_metadata(file_info)
+                if meta and isinstance(meta, dict):
+                    duration = meta.get('duration', 0)
+                    m, s = divmod(int(duration), 60)
+                    h, m = divmod(m, 60)
+                    return f"{h:02}:{m:02}:{s:02}"
+                return meta if meta == "Loading..." else ""
+            elif column == 11: # 解像度
+                meta = self.get_video_metadata(file_info)
+                if meta and isinstance(meta, dict):
+                    return f"{meta.get('width', 0)}x{meta.get('height', 0)}"
+                return meta if meta == "Loading..." else ""
+            elif column == 12: # FPS
+                meta = self.get_video_metadata(file_info)
+                if meta and isinstance(meta, dict):
+                    return f"{meta.get('fps', 0):.2f}"
+                return meta if meta == "Loading..." else ""
         
         return None
     
@@ -237,6 +263,49 @@ class CustomFileSystemModel(QFileSystemModel):
             return perm_str
         except:
             return "---------"
+
+    def get_video_metadata(self, file_info):
+        """動画メタデータを取得（キャッシュまたは非同期取得）"""
+        path = file_info.absoluteFilePath()
+        
+        # 動画ファイルでない場合は空文字
+        video_extensions = {'.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v', '.3gp', '.mpg', '.mpeg'}
+        if file_info.suffix().lower() not in [ext.lstrip('.') for ext in video_extensions]:
+            return None
+
+        # キャッシュにあれば返す
+        if hasattr(self, 'metadata_cache') and path in self.metadata_cache:
+            return self.metadata_cache[path]
+        
+        # キャッシュになく、取得中でなければリクエスト
+        if hasattr(self, 'metadata_loading') and path not in self.metadata_loading:
+             self.request_metadata_fetch(path)
+             self.metadata_loading.add(path)
+        
+        return "Loading..."
+
+    def request_metadata_fetch(self, path):
+        """メタデータ取得リクエストを発行（シグナル経由などでメインウィンドウのWorkerにつなぐ想定）"""
+        # モデル単体ではスレッド管理が難しいため、シグナルを発行して親に委譲するのが一般的だが、
+        # ここでは簡易的に管理用のシグナルを定義してemitする形にする
+        if hasattr(self, 'metadata_fetch_requested'):
+            self.metadata_fetch_requested.emit(path)
+
+    def update_metadata(self, path, metadata):
+        """非同期取得完了後のコールバック"""
+        if hasattr(self, 'metadata_loading') and path in self.metadata_loading:
+            self.metadata_loading.remove(path)
+        
+        if not hasattr(self, 'metadata_cache'):
+            self.metadata_cache = {}
+            
+        self.metadata_cache[path] = metadata
+        
+        # モデルの更新を通知
+        index = self.index(path)
+        if index.isValid():
+            # 10, 11, 12列目が更新されたとみなす
+            self.dataChanged.emit(index.sibling(index.row(), 10), index.sibling(index.row(), 12), [Qt.DisplayRole])
     
     def get_attributes(self, file_info):
         """属性文字列を取得"""
@@ -651,6 +720,23 @@ class LeftPaneWidget(QWidget):
             return self.folder_model.filePath(current_index)
         return None
 
+class VideoMetadataWorker(QObject):
+    """動画メタデータを非同期で取得するワーカー"""
+    metadata_ready = Signal(str, dict)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.generator = VideoDigestGenerator()
+
+    def fetch_metadata(self, path):
+        """メタデータを取得してシグナルで返す"""
+        # ここは別スレッドで実行される想定
+        info = self.generator.get_video_info(path)  # video_digest.py にあるメソッド
+        if info:
+            self.metadata_ready.emit(path, info)
+        else:
+            self.metadata_ready.emit(path, {"error": "Failed"})
+
 class FileManagerWidget(QWidget):
     COLUMN_WIDTHS_KEY = "column_widths"
     DETAIL_VIEW_COLUMNS = [
@@ -664,6 +750,9 @@ class FileManagerWidget(QWidget):
         ("extension", 7),
         ("owner", 8),
         ("group", 9),
+        ("duration", 10),
+        ("resolution", 11),
+        ("fps", 12),
     ]
 
     DEFAULT_COLUMN_WIDTHS = {
@@ -677,6 +766,9 @@ class FileManagerWidget(QWidget):
         "extension": 110,
         "owner": 160,
         "group": 160,
+        "duration": 100,
+        "resolution": 100,
+        "fps": 60,
     }
 
     def apply_settings(self):
@@ -728,10 +820,13 @@ class FileManagerWidget(QWidget):
             "modified": True,
             "permissions": False,
             "created": False,
-            "attributes": False,
+            "attributes": True,
             "extension": False,
             "owner": False,
-            "group": False
+            "group": False,
+            "duration": True,
+            "resolution": True,
+            "fps": False
         }
         # ファイル属性による色設定
         self.attribute_colors = {
@@ -742,6 +837,16 @@ class FileManagerWidget(QWidget):
         }
         self.worker_thread = None
         self.worker = None
+        
+        # メタデータ取得用スレッドプール/ワーカー
+        from PySide6.QtCore import QThreadPool
+        self.thread_pool = QThreadPool()
+        if VIDEO_DIGEST_AVAILABLE:
+            self.metadata_worker = VideoMetadataWorker() # ワーカーインスタンス（ロジック保持用）
+            self.metadata_worker.metadata_ready.connect(self._on_metadata_ready)
+        else:
+            self.metadata_worker = None
+
         self.video_digest_generator = VideoDigestGenerator() if VIDEO_DIGEST_AVAILABLE else None
         self._opencv_warning_shown = False
         self.thumbnail_preview = None
@@ -860,6 +965,32 @@ class FileManagerWidget(QWidget):
             return candidate.upper()
         return default
 
+    def _on_metadata_ready(self, path: str, info: dict) -> None:
+        """動画メタデータ取得完了時の処理"""
+        # メインスレッドでUI更新を行うため、安全策をとる
+        # dataChangedは自動的にUI更新をトリガーする
+        if hasattr(self, 'file_system_model'):
+            self.file_system_model.update_metadata(path, info)
+
+    def _request_metadata_fetch(self, path: str) -> None:
+        """動画メタデータの取得をリクエスト"""
+        # ワーカーで非同期実行
+        from PySide6.QtCore import QRunnable
+
+        class FetchTask(QRunnable):
+            def __init__(self, worker, path):
+                super().__init__()
+                self.worker = worker
+                self.path = path
+            
+            def run(self):
+                self.worker.fetch_metadata(self.path)
+        
+        # 既に取得中かどうかはモデル側で制御されているが、念のため
+        if self.metadata_worker:
+            task = FetchTask(self.metadata_worker, path)
+            self.thread_pool.start(task)
+
     def cleanup_worker(self):
         """ワーカースレッドのクリーンアップ"""
         if self.worker_thread and self.worker_thread.isRunning():
@@ -944,6 +1075,11 @@ class FileManagerWidget(QWidget):
         
         # リストビューを右ペインに追加
         self.right_pane_layout.addWidget(self.list_view, 1)
+
+        # マウス追跡を有効化（ホバーイベント用）
+        self.list_view.setMouseTracking(True)
+        self.list_view.entered.connect(self.on_list_view_entered)
+
 
         self.thumbnail_preview = VideoThumbnailPreview(
             self.right_pane_widget,
@@ -1121,6 +1257,10 @@ class FileManagerWidget(QWidget):
         
         # チェックボックス選択変更時のシグナル接続
         self.proxy_model.dataChanged.connect(self.on_checkbox_selection_changed)
+
+        # 動画メタデータ取得リクエスト
+        if hasattr(self.file_system_model, 'metadata_fetch_requested'):
+            self.file_system_model.metadata_fetch_requested.connect(self._request_metadata_fetch)
     
     def setup_context_menus(self):
         """コンテキストメニューの設定"""
@@ -1304,6 +1444,20 @@ class FileManagerWidget(QWidget):
             # ステータスバーに選択数を表示
             if hasattr(self, 'statusBar'):
                 self.statusBar().showMessage(f"選択されたファイル: {selected_count}個")
+
+    def on_list_view_entered(self, index):
+        """リストビューでアイテムにマウスが乗った時の処理"""
+        if not index.isValid():
+             return
+
+        # プロキシモデル経由でソースインデックスを取得
+        source_index = self.proxy_model.mapToSource(index)
+        path = self.file_system_model.filePath(source_index)
+        
+        # 動画ファイルか判定
+        is_video = bool(self.video_digest_generator and self.video_digest_generator.is_video_file(path))
+        if is_video and self.thumbnail_preview:
+             self.thumbnail_preview.display_video(path)
     
     def show_file_search_dialog(self):
         """ファイル検索ダイアログを表示（呼び出し時にモジュールをロード）"""
@@ -1969,10 +2123,13 @@ class FileManagerWidget(QWidget):
                 "modified": self._coerce_bool(self.settings.value("show_modified", True), True),
                 "permissions": self._coerce_bool(self.settings.value("show_permissions", False), False),
                 "created": self._coerce_bool(self.settings.value("show_created", False), False),
-                "attributes": self._coerce_bool(self.settings.value("show_attributes", False), False),
+                "attributes": self._coerce_bool(self.settings.value("show_attributes", True), True),
                 "extension": self._coerce_bool(self.settings.value("show_extension", False), False),
                 "owner": self._coerce_bool(self.settings.value("show_owner", False), False),
                 "group": self._coerce_bool(self.settings.value("show_group", False), False),
+                "duration": self._coerce_bool(self.settings.value("show_duration", True), True),
+                "resolution": self._coerce_bool(self.settings.value("show_resolution", True), True),
+                "fps": self._coerce_bool(self.settings.value("show_fps", False), False),
             }
 
             # 隠しファイル表示設定を読み込み
@@ -2026,8 +2183,9 @@ class FileManagerWidget(QWidget):
             # デフォルト設定にフォールバック
             self.visible_columns = {
                 "name": True, "size": True, "type": True, "modified": True,
-                "permissions": False, "created": False, "attributes": False,
-                "extension": False, "owner": False, "group": False
+                "permissions": False, "created": False, "attributes": True,
+                "extension": False, "owner": False, "group": False, 
+                "duration": True, "resolution": True, "fps": False
             }
             self.show_hidden = False
             self.attribute_colors = {
@@ -2046,10 +2204,13 @@ class FileManagerWidget(QWidget):
                 "modified": True,
                 "permissions": False,
                 "created": False,
-                "attributes": False,
+                "attributes": True,
                 "extension": False,
                 "owner": False,
                 "group": False,
+                "duration": True,
+                "resolution": True,
+                "fps": False,
             }
             for key, default in column_defaults.items():
                 value = self.visible_columns.get(key, default)
@@ -2083,6 +2244,9 @@ class FileManagerWidget(QWidget):
             ("拡張子", "extension", 7, True),
             ("所有者", "owner", 8, True),
             ("グループ", "group", 9, True),
+            ("再生時間", "duration", 10, True),
+            ("解像度", "resolution", 11, True),
+            ("FPS", "fps", 12, True),
         ]
         
         # 各列のチェックボックスアクションを作成
@@ -2492,7 +2656,11 @@ class SettingsDialog(QDialog):
         self.settings.setValue("list_font_size", self.list_font_size.value())
 
         # 表示列設定を保存 (ダイアログ上の状態を優先)
-        updated_columns = {
+        # 既存の設定をベースにする（durationなどの追加列が消えないように）
+        updated_columns = self.visible_columns.copy()
+        
+        # ダイアログで設定可能な項目を上書き
+        updated_columns.update({
             "name": True,
             "size": self.size_checkbox.isChecked(),
             "type": self.type_checkbox.isChecked(),
@@ -2503,7 +2671,7 @@ class SettingsDialog(QDialog):
             "extension": self.extension_checkbox.isChecked(),
             "owner": self.owner_checkbox.isChecked(),
             "group": self.group_checkbox.isChecked(),
-        }
+        })
         self.visible_columns = updated_columns.copy()
         for key, value in updated_columns.items():
             self.settings.setValue(f"show_{key}", value)
@@ -2589,6 +2757,34 @@ class SettingsDialog(QDialog):
                 self.close()
             except Exception:
                 pass
+
+    def _handle_metadata_fetch_request(self, path):
+        """モデルからのメタデータ取得リクエストを処理"""
+        from PySide6.QtCore import QRunnable
+
+        class FetchTask(QRunnable):
+            def __init__(self, worker, path):
+                super().__init__()
+                self.worker = worker
+                self.path = path
+            
+            def run(self):
+                self.worker.fetch_metadata(self.path)
+
+        task = FetchTask(self.metadata_worker, path)
+        self.thread_pool.start(task)
+
+    def _on_metadata_ready(self, path, info):
+        """メタデータ取得完了時の処理"""
+        # 現在のビューのモデルを取得して更新
+        if hasattr(self, 'list_view') and self.view_mode == "detail":
+             model = self.list_view.model()
+             # プロキシモデルの可能性があるため、ソースモデルまで辿る
+             while hasattr(model, 'sourceModel'):
+                 model = model.sourceModel()
+             
+             if isinstance(model, CustomFileSystemModel):
+                 model.update_metadata(path, info)
 
 class FileItemDelegate(QStyledItemDelegate):
     """ファイル属性に基づいてアイテムの表示を変更するカスタムデリゲート"""

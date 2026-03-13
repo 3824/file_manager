@@ -1,0 +1,18 @@
+# Project Overview
+- プロジェクト: GUIファイラー（クロスプラットフォーム対応のファイルマネージャー）
+- 目的: Windows/macOS/Linux で動作する2ペインGUIファイラーを提供し、標準ファイル操作に加えて動画・検索・分析機能を提供する。
+- 主要技術:
+  - Python（運用方針は 3.13）
+  - PySide6（GUI）
+  - PyInstaller（配布用ビルド）
+  - pytest 系（テスト）
+  - 任意機能: OpenCV/numpy（動画ダイジェスト）、winshell or send2trash（ゴミ箱移動）
+- エントリーポイント:
+  - `run.py` が `src/file_manager/main.py` の `main()` を呼び出す。
+- 主な機能（README記載）:
+  - ファイル/フォルダ表示、移動、削除、名前変更
+  - 表示切替、ソート、検索
+  - 動画ダイジェスト表示（任意依存）
+  - 同一動画検出とゴミ箱移動
+  - SQLiteインデックス検索
+  - ディスク使用量分析
