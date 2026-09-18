@@ -20,9 +20,23 @@ from PySide6.QtWidgets import (
     QTreeWidget,
     QTreeWidgetItem,
     QMessageBox,
+    QAbstractItemView,
+    QMenu,
 )
+import re
+
+try:
+    import winshell
+except ImportError:
+    winshell = None
+
+try:
+    import send2trash
+except ImportError:
+    send2trash = None
 
 from .video_duplicates import DuplicateGroup, find_duplicate_videos
+from .utils import silent_question, silent_information, silent_warning
 
 
 class VideoDuplicatesWorker(QObject):
@@ -103,9 +117,19 @@ class VideoDuplicatesDialog(QDialog):
         self.tree.setColumnWidth(0, 520)
         self.tree.setAlternatingRowColors(True)
         self.tree.itemDoubleClicked.connect(self._on_item_double_clicked)
+        self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._show_context_menu)
+        self.tree.itemSelectionChanged.connect(self._on_item_selection_changed)
         layout.addWidget(self.tree, stretch=1)
 
         button_layout = QHBoxLayout()
+        
+        self.delete_button = QPushButton("選択したファイルを削除")
+        self.delete_button.clicked.connect(self._delete_selected_files)
+        self.delete_button.setEnabled(False)
+        button_layout.addWidget(self.delete_button)
+
         button_layout.addStretch(1)
 
         self.close_button = QPushButton("閉じる")
@@ -188,6 +212,139 @@ class VideoDuplicatesDialog(QDialog):
         if not path:
             return
         self._open_file(path)
+
+    def _on_item_selection_changed(self) -> None:
+        """選択変更時の処理"""
+        selected_count = len(self.tree.selectedItems())
+        if hasattr(self, 'delete_button'):
+            self.delete_button.setEnabled(selected_count > 0)
+
+    def _show_context_menu(self, position) -> None:
+        """コンテキストメニューを表示"""
+        item = self.tree.itemAt(position)
+        if not item:
+            return
+
+        menu = QMenu(self)
+        
+        path = item.data(0, Qt.UserRole)
+        if path:
+            open_action = menu.addAction("開く")
+            open_action.triggered.connect(lambda: self._open_file(path))
+            menu.addSeparator()
+
+        delete_action = menu.addAction("選択したファイルを削除")
+        # 選択されているアイテムがある場合のみ有効化
+        if len(self.tree.selectedItems()) > 0:
+            delete_action.setEnabled(True)
+            delete_action.triggered.connect(self._delete_selected_files)
+        else:
+            delete_action.setEnabled(False)
+        
+        menu.exec(self.tree.mapToGlobal(position))
+
+    def _delete_selected_files(self) -> None:
+        """選択されたファイルを削除"""
+        items = self.tree.selectedItems()
+        if not items:
+            return
+
+        files_to_delete = []
+        items_to_delete = []
+        
+        for item in items:
+            filepath = item.data(0, Qt.UserRole)
+            if filepath: # グループヘッダーでなくファイルの場合
+                files_to_delete.append(filepath)
+                items_to_delete.append(item)
+
+        if not files_to_delete:
+            silent_information(self, "情報", "削除可能なファイルが選択されていません。")
+            return
+
+        # 確認ダイアログ
+        reply = silent_question(
+            self,
+            "確認",
+            f"{len(files_to_delete)} 個のファイルを削除しますか？\n（可能な場合はゴミ箱へ移動します）",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+            
+        # 削除実行
+        deleted_count = 0
+        failed_files = []
+        
+        # 削除対象アイテムからパスを取得して削除
+        for i, filepath in enumerate(files_to_delete):
+            if self._move_to_trash(filepath):
+                deleted_count += 1
+                # ツリーから削除
+                item = items_to_delete[i]
+                parent_item = item.parent()
+                if parent_item:
+                    parent_item.removeChild(item)
+                    # 親項目のテキスト（件数）を更新する
+                    current_count = parent_item.childCount()
+                    # グループタイトルからグループ名を抽出して更新
+                    # 形式: "グループ X (N 件)"
+                    old_text = parent_item.text(0)
+                    match = re.match(r"(グループ \d+) \((\d+) 件\)", old_text)
+                    if match:
+                        group_name = match.group(1)
+                        new_text = f"{group_name} ({current_count} 件)"
+                        parent_item.setText(0, new_text)
+            else:
+                failed_files.append(filepath)
+        
+        # グループのクリーンアップ
+        self._clean_empty_groups()
+
+        if failed_files:
+            message = f"{deleted_count} 個のファイルを削除しました。\n\n削除に失敗したファイル:\n" + "\n".join(failed_files)
+            silent_warning(self, "一部失敗", message)
+        else:
+            silent_information(self, "完了", f"{deleted_count} 個のファイルを削除しました。")
+
+    def _move_to_trash(self, file_path: str) -> bool:
+        """ファイルをゴミ箱に移動、または削除"""
+        try:
+            if not os.path.exists(file_path):
+                # 既に存在しない場合も成功とみなす
+                return True
+
+            if sys.platform == "win32" and winshell:
+                try:
+                    winshell.delete_file(file_path, no_confirm=True, allow_undo=True)
+                    return True
+                except Exception:
+                    pass # winshell失敗時は次へ
+            
+            if send2trash:
+                try:
+                    send2trash.send2trash(file_path)
+                    return True
+                except Exception:
+                    pass # send2trash失敗時は次へ
+
+            # フォールバック: 通常削除（ゴミ箱なし）
+            os.remove(file_path)
+            return True
+
+        except Exception as e:
+            # print(f"Delete error ({file_path}): {e}")
+            return False
+
+    def _clean_empty_groups(self) -> None:
+        """項目が1つ以下になったグループを削除"""
+        root = self.tree.invisibleRootItem()
+        # 逆順に削除しないとインデックスがずれる
+        for i in range(root.childCount() - 1, -1, -1):
+            group_item = root.child(i)
+            # 子要素が1つ以下なら重複ではないので削除
+            if group_item.childCount() < 2:
+                self.tree.takeTopLevelItem(i)
 
     def _open_file(self, file_path: str) -> None:
         try:

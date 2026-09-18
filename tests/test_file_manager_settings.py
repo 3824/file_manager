@@ -130,7 +130,8 @@ def test_visible_columns_structure():
                     # 期待される列キーが全て存在することを確認
                     expected_keys = [
                         "name", "size", "type", "modified", "permissions", 
-                        "created", "attributes", "extension", "owner", "group"
+                        "created", "attributes", "extension", "owner", "group",
+                        "duration", "resolution", "fps"
                     ]
                     
                     for key in expected_keys:

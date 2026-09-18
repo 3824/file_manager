@@ -87,3 +87,78 @@ def test_set_preferences_restarts_current_video(monkeypatch, qtbot, tmp_path):
     assert calls["count"] == 1
     assert preview._max_thumbnails >= 2
 
+
+def test_thumbnail_preview_uses_memory_cache(monkeypatch, qtbot, tmp_path):
+    preview = VideoThumbnailPreview()
+    qtbot.addWidget(preview)
+
+    if not preview.is_available:
+        pytest.skip("Video digest feature is disabled")
+
+    calls = {"count": 0}
+
+    def fake_start(self, video_path, token):
+        calls["count"] += 1
+        pixmap = QPixmap(20, 10)
+        pixmap.fill()
+        self._handle_digest(token, video_path, [pixmap])
+        self._handle_finished(token)
+
+    monkeypatch.setattr(
+        preview,
+        "_start_worker",
+        types.MethodType(fake_start, preview),
+    )
+
+    video_file = tmp_path / "cached.mp4"
+    video_file.write_bytes(b"fake")
+
+    preview.display_video(str(video_file))
+    assert calls["count"] == 1
+
+    preview.display_video(None)
+    preview.display_video(str(video_file))
+
+    assert calls["count"] == 1
+
+
+def test_thumbnail_preview_uses_disk_cache_before_worker(monkeypatch, qtbot, tmp_path):
+    preview = VideoThumbnailPreview()
+    qtbot.addWidget(preview)
+
+    if not preview.is_available:
+        pytest.skip("Video digest feature is disabled")
+
+    pixmap = QPixmap(20, 10)
+    pixmap.fill()
+
+    class FakeDiskCache:
+        def cache_key(self, path):
+            return "key"
+
+        def get_thumbnails(self, key):
+            return [pixmap]
+
+        def put_thumbnails(self, key, thumbnails):
+            return None
+
+    preview._disk_cache = FakeDiskCache()
+
+    called = {"worker": 0}
+
+    def fake_start(self, video_path, token):
+        called["worker"] += 1
+
+    monkeypatch.setattr(
+        preview,
+        "_start_worker",
+        types.MethodType(fake_start, preview),
+    )
+
+    video_file = tmp_path / "disk.mp4"
+    video_file.write_bytes(b"fake")
+    preview.display_video(str(video_file))
+
+    assert called["worker"] == 0
+    assert preview._thumbnail_labels
+

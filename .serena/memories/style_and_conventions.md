@@ -1,0 +1,19 @@
+# Style and Conventions
+- 返信/コミュニケーション: 日本語で簡潔かつ丁寧（AGENTS.md）
+- Pythonスタイル:
+  - PEP8 準拠
+  - フォーマッタ: Black
+  - import整列: isort
+  - リンター: flake8
+- 命名傾向（既存コード）:
+  - モジュール/関数/メソッドは `snake_case`
+  - クラスは `PascalCase`
+  - 定数は `UPPER_SNAKE_CASE`
+- セキュリティ方針:
+  - APIキー等の秘密情報は `.env` / 環境変数で管理し、コード直書き禁止
+  - 依存導入時はセキュリティ確認
+  - （AGENTS.mdには Django バリデーション・DEBUG=False の記載あり。Web文脈の一般指針として扱う）
+- PR方針:
+  - タイトル形式: `feat: 機能概要`
+  - 1PRは小さく関連変更に限定
+  - 変更内容・目的・確認方法を簡潔に記載

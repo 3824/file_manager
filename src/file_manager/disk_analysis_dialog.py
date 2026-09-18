@@ -204,11 +204,21 @@ class DiskAnalysisDialog(QDialog):
         # ヘッダー情報
         self.create_header_section(layout)
         
-        # プログレスバー
+        # プログレスエリア（バー + 現在スキャン中パス + 停止ボタン）
+        progress_row = QHBoxLayout()
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
-        self.progress_bar.setRange(0, 100)
-        layout.addWidget(self.progress_bar)
+        self.progress_bar.setRange(0, 0)  # indeterminate
+        self.progress_scan_label = QLabel()
+        self.progress_scan_label.setVisible(False)
+        self.progress_scan_label.setWordWrap(False)
+        self.cancel_button = QPushButton("停止")
+        self.cancel_button.setVisible(False)
+        self.cancel_button.clicked.connect(self._cancel_analysis)
+        progress_row.addWidget(self.progress_bar, 1)
+        progress_row.addWidget(self.cancel_button, 0)
+        layout.addLayout(progress_row)
+        layout.addWidget(self.progress_scan_label)
         
         # メインコンテンツエリア
         self.create_main_content(layout)
@@ -359,35 +369,60 @@ class DiskAnalysisDialog(QDialog):
         
         parent_layout.addLayout(button_layout)
     
+    def _cancel_analysis(self) -> None:
+        """実行中の分析をキャンセルする（UIスレッドをブロックしない）。"""
+        if self.analysis_worker and self.analysis_worker.isRunning():
+            self.analysis_worker.cancel()
+            # wait は UI スレッドをブロックするため呼ばない。
+            # worker の finished シグナルで on_worker_finished が後片付けする。
+        self._hide_progress()
+
+    def _hide_progress(self) -> None:
+        self.progress_bar.setVisible(False)
+        self.progress_scan_label.setVisible(False)
+        self.cancel_button.setVisible(False)
+        self.analyze_button.setEnabled(True)
+        self.open_folder_button.setEnabled(True)
+
+    def _on_current_path_updated(self, path: str) -> None:
+        """スキャン中パスをラベルに表示する（省略表示）。"""
+        max_len = 80
+        display = path if len(path) <= max_len else f"…{path[-(max_len - 1):]}"
+        self.progress_scan_label.setText(f"スキャン中: {display}")
+
     def start_analysis(self):
         """分析を開始"""
-        # 選択されたドライブのパスを取得
+        # 前回の worker をキャンセル
+        # 前回 worker をキャンセル（wait しない。古い worker の finished はクロージャで無視する）
+        if self.analysis_worker and self.analysis_worker.isRunning():
+            self.analysis_worker.cancel()
+
         current_drive = self.drive_combo.currentData()
         if current_drive:
             self.current_path = current_drive
-        
-        # プログレスバーを表示
+
+        # プログレスバーを indeterminate 表示
+        self.progress_bar.setRange(0, 0)
         self.progress_bar.setVisible(True)
-        self.progress_bar.setValue(0)
-        
+        self.progress_scan_label.setText("")
+        self.progress_scan_label.setVisible(True)
+        self.cancel_button.setVisible(True)
+
         # ボタンを無効化
         self.analyze_button.setEnabled(False)
         self.open_folder_button.setEnabled(False)
-        
-        # パスラベルを更新
+
         self.path_label.setText(f"分析対象: {self.current_path}")
-        
-        # ワーカースレッドを作成して実行
-        self.analysis_worker = DiskAnalysisWorker(self.current_path)
-        
-        # シグナルを接続
-        self.analysis_worker.analysis_completed.connect(self.on_analysis_completed)
-        self.analysis_worker.progress_updated.connect(self.on_progress_updated)
-        self.analysis_worker.error_occurred.connect(self.on_error_occurred)
-        self.analysis_worker.finished.connect(self.on_worker_finished)
-        
-        # スレッドを開始
-        self.analysis_worker.start()
+
+        new_worker = DiskAnalysisWorker(self.current_path)
+        self.analysis_worker = new_worker
+        new_worker.analysis_completed.connect(self.on_analysis_completed)
+        new_worker.progress_updated.connect(self.on_progress_updated)
+        new_worker.error_occurred.connect(self.on_error_occurred)
+        new_worker.current_path_updated.connect(self._on_current_path_updated)
+        # lambda でこの worker インスタンスを束縛し、古い worker の finished と区別する
+        new_worker.finished.connect(lambda w=new_worker: self._on_worker_finished(w))
+        new_worker.start()
     
     def on_analysis_completed(self, analysis_data):
         """分析完了時の処理"""
@@ -454,22 +489,28 @@ class DiskAnalysisDialog(QDialog):
             QMessageBox.warning(self, "エラー", f"フォルダを開けませんでした: {str(e)}")
     
     def on_progress_updated(self, progress):
-        """進捗更新時の処理"""
-        self.progress_bar.setValue(progress)
-    
+        """進捗更新時の処理（indeterminate モードでは呼ばれないが互換のため残す）。"""
+        if self.progress_bar.maximum() != 0:
+            self.progress_bar.setValue(progress)
+
     def on_error_occurred(self, error_message):
         """エラー発生時の処理"""
+        self._hide_progress()
         QMessageBox.warning(self, "エラー", error_message)
-    
+
+    def _on_worker_finished(self, worker) -> None:
+        """ワーカースレッド終了時の処理（worker インスタンスで新旧を区別）。"""
+        if self.analysis_worker is not worker:
+            # キャンセルされた古い worker の finished シグナル → 無視してクリーンアップのみ
+            worker.deleteLater()
+            return
+        self._hide_progress()
+        self.analysis_worker = None
+        worker.deleteLater()
+
     def on_worker_finished(self):
-        """ワーカースレッド終了時の処理"""
-        # プログレスバーを非表示
-        self.progress_bar.setVisible(False)
-        
-        # ボタンを有効化
-        self.analyze_button.setEnabled(True)
-        
-        # ワーカースレッドをクリーンアップ
+        """後方互換のため残す（直接呼び出しがある場合のフォールバック）。"""
+        self._hide_progress()
         if self.analysis_worker:
             self.analysis_worker.deleteLater()
             self.analysis_worker = None
@@ -477,11 +518,12 @@ class DiskAnalysisDialog(QDialog):
     def closeEvent(self, event):
         """ダイアログが閉じられる時の処理"""
         # ワーカースレッドが実行中の場合は停止
-        if self.analysis_worker and self.analysis_worker.isRunning():
-            self.analysis_worker.quit()
-            self.analysis_worker.wait(3000)
-            if self.analysis_worker.isRunning():
-                self.analysis_worker.terminate()
-                self.analysis_worker.wait(3000)
+        worker = self.analysis_worker
+        if worker and worker.isRunning():
+            worker.quit()
+            worker.wait(3000)
+            if worker.isRunning():
+                worker.terminate()
+                worker.wait(3000)
         
         super().closeEvent(event)

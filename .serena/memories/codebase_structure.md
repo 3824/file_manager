@@ -1,0 +1,16 @@
+# Codebase Structure
+- ルート主要ファイル:
+  - `run.py`: 実行用スクリプト
+  - `build_exe.py`: PyInstallerビルド/クリーン
+  - `requirements.txt`, `requirements-test.txt`
+  - `README.md`, `quickstart.md`, `howtouse.md`, `AGENTS.md`
+- ソースコード:
+  - `src/file_manager/`
+  - 主要モジュール:
+    - `main.py`（MainWindow, main）
+    - `file_manager.py`（FileManagerWidget 等の中核UI/機能）
+    - `video_*`, `file_search*`, `disk_analysis*`, `models.py` など
+- テスト:
+  - `tests/` 配下に pytest テスト群（UI関連含む）
+- 補足:
+  - `src/file_manager/__pycache__/` が存在（生成物）

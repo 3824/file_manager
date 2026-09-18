@@ -9,7 +9,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from file_manager import video_digest
 from file_manager.file_manager import SettingsDialog, FileManagerWidget, CustomFileSystemModel
+from file_manager.qt_models import FileSortFilterProxyModel
 from PySide6.QtCore import QSettings, Qt
+from PySide6.QtWidgets import QDialog
 
 
 def test_video_digest_fallback_emits_digest(qtbot, tmp_path):
@@ -45,7 +47,7 @@ def test_video_digest_fallback_emits_digest(qtbot, tmp_path):
     assert len(thumbs) == 2
 
 
-def test_settings_accept_does_not_crash(qtbot, monkeypatch):
+def test_settings_accept_does_not_crash(qtbot):
     """SettingsDialog.accept should not raise even if parent updates fail"""
     # Create a parent that intentionally raises on update to simulate edge case
     class BadParent:
@@ -59,19 +61,12 @@ def test_settings_accept_does_not_crash(qtbot, monkeypatch):
 
     parent = BadParent()
 
-    called = {}
-
-    def dummy_message(self):
-        called['invoked'] = True
-
-    monkeypatch.setattr(SettingsDialog, '_show_save_success_message', dummy_message)
-
     dialog = SettingsDialog(parent, QSettings('FileManager', 'Settings'), parent.visible_columns)
 
     # calling accept should not raise
     dialog.accept()
 
-    assert called.get('invoked')
+    assert dialog.result() == QDialog.DialogCode.Accepted
 
 
 def test_search_button_dynamic_import(qtbot, monkeypatch):
@@ -108,4 +103,33 @@ def test_attribute_column_uses_default_background(qtbot, tmp_path):
     attr_index = model.index(item_index.row(), 6, item_index.parent())
     assert attr_index.isValid()
     assert model.data(attr_index, Qt.BackgroundRole) is None
+
+
+def test_file_sort_proxy_compares_modified_datetime_as_timestamp(qtbot, tmp_path):
+    """更新日時列は表示文字列ではなくタイムスタンプで比較する。"""
+    old_file = tmp_path / "z_old.txt"
+    new_file = tmp_path / "a_new.txt"
+    old_file.write_text("old")
+    new_file.write_text("new")
+    os.utime(old_file, (1_600_000_000, 1_600_000_000))
+    os.utime(new_file, (1_700_000_000, 1_700_000_000))
+
+    model = CustomFileSystemModel()
+    model.setRootPath(str(tmp_path))
+    root_index = model.index(str(tmp_path))
+    qtbot.waitUntil(lambda: model.rowCount(root_index) >= 2, timeout=2000)
+
+    proxy = FileSortFilterProxyModel()
+    proxy.setSourceModel(model)
+
+    old_index = model.index(str(old_file))
+    new_index = model.index(str(new_file))
+    assert old_index.isValid()
+    assert new_index.isValid()
+
+    old_modified = old_index.sibling(old_index.row(), 3)
+    new_modified = new_index.sibling(new_index.row(), 3)
+
+    assert proxy.lessThan(old_modified, new_modified) is True
+    assert proxy.lessThan(new_modified, old_modified) is False
 

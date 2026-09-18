@@ -38,6 +38,7 @@ except ImportError:
     HAS_SEND2TRASH = False
 
 from .same_filesize import SameFileSizeGroup, find_same_filesize_files, format_file_size
+from .utils import silent_question, silent_information, silent_warning
 
 # 定数
 WORKER_CLEANUP_TIMEOUT_MS = 3000  # ワーカークリーンアップのタイムアウト（ミリ秒）
@@ -373,15 +374,15 @@ class SameFileSizeDialog(QDialog):
     def delete_selected_files(self):
         """選択されたファイルを削除（ゴミ箱へ移動）"""
         if not HAS_SEND2TRASH:
-            QMessageBox.warning(self, "エラー", "send2trashモジュールがインストールされていません。")
+            silent_warning(self, "エラー", "send2trashモジュールがインストールされていません。")
             return
 
         selected_paths = self.get_selected_file_paths()
         if not selected_paths:
-            QMessageBox.warning(self, "警告", "ファイルが選択されていません。")
+            silent_warning(self, "警告", "ファイルが選択されていません。")
             return
 
-        reply = QMessageBox.question(
+        reply = silent_question(
             self,
             "確認",
             f"{len(selected_paths)} 個のファイルをゴミ箱に移動しますか？",
@@ -402,7 +403,7 @@ class SameFileSizeDialog(QDialog):
 
             # 結果を表示
             if error_files:
-                QMessageBox.warning(
+                silent_warning(
                     self,
                     "削除エラー",
                     f"{success_count} 個のファイルを削除しました。\n\n"
@@ -411,7 +412,7 @@ class SameFileSizeDialog(QDialog):
                     (f"\n... 他 {len(error_files) - 10} 件" if len(error_files) > 10 else "")
                 )
             else:
-                QMessageBox.information(
+                silent_information(
                     self,
                     "削除完了",
                     f"{success_count} 個のファイルをゴミ箱に移動しました。"
@@ -446,7 +447,7 @@ class SameFileSizeDialog(QDialog):
     def closeEvent(self, event: QCloseEvent):
         """ダイアログを閉じる際の処理"""
         if self.worker_thread and self.worker_thread.isRunning():
-            reply = QMessageBox.question(
+            reply = silent_question(
                 self,
                 "確認",
                 "スキャンが実行中です。キャンセルして閉じますか？",
