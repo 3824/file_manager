@@ -1,291 +1,279 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-動画ファイルのダイジェスト生成機能
-"""
+"""動画ダイジェスト生成処理。"""
+
+from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Optional
 
-from PySide6.QtCore import QObject, Signal, QThread, QTimer
-from PySide6.QtGui import QImage, QPainter, QPixmap
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QObject, QThread, Qt, Signal
+from PySide6.QtGui import QColor, QImage, QPainter, QPixmap
 
-from .video_features import VideoFeatures, extract_video_features
+from .video_features import extract_thumbnails_with_burst, extract_thumbnails_only
 
-# OpenCVとNumPyのインポート
+# バーストモード時に前後それぞれ抽出するフレーム数（アニメーション用）
+DEFAULT_BURST_COUNT = 3
+# アニメーション表示に使う間引きステップ
+ANIMATION_STEP = 1
+
 try:
     import cv2
-    import numpy as np
+    import numpy as _np
+
     OPENCV_AVAILABLE = True
 except ImportError:
     OPENCV_AVAILABLE = False
     cv2 = None
-    np = None
+    _np = None
 
 
 class VideoDigestGenerator(QObject):
-    """動画ダイジェスト生成クラス"""
-    
-    # シグナル定義
-    digest_generated = Signal(str, list)  # ファイルパス, サムネイル画像のリスト
-    progress_updated = Signal(int)  # 進捗（0-100）
-    error_occurred = Signal(str)  # エラーメッセージ
-    
+    """動画ダイジェスト生成クラス。"""
+
+    digest_generated = Signal(str, list)
+    thumbnail_ready = Signal(int, QImage)        # QImage: スレッドセーフ
+    thumbnail_sequence_ready = Signal(int, list) # list[QImage]: スレッドセーフ
+    progress_updated = Signal(int)
+    error_occurred = Signal(str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.video_extensions = {'.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v', '.3gp', '.mpg', '.mpeg'}
-        self.max_thumbnails = 6  # デフォルトのサムネイル数
-        self.thumbnail_size = (160, 90)  # デフォルトのサムネイルサイズ
-        
+        self.video_extensions = {
+            ".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv",
+            ".webm", ".m4v", ".3gp", ".mpg", ".mpeg",
+        }
+        self.max_thumbnails = 6
+        self.thumbnail_size = (160, 90)
+        self.burst_count = 0
+
     def is_video_file(self, file_path):
-        """動画ファイルかどうかを判定"""
-        if not os.path.isfile(file_path):
-            return False
-        
-        file_ext = Path(file_path).suffix.lower()
-        return file_ext in self.video_extensions
-    
-    def generate_digest(self, video_path, max_thumbnails=None, thumbnail_size=None) -> Optional[VideoFeatures]:
-        """動画のダイジェストを生成
+        """動画ファイルか判定。"""
+        return os.path.isfile(file_path) and Path(file_path).suffix.lower() in self.video_extensions
 
-        OpenCVが利用できない場合は、実行時エラーではなくプレースホルダーのサムネイルを
-        生成して `digest_generated` を発行するフォールバックを提供します。
-        これにより、UIはサムネイルがなくても正常に動作します。
+    def _emit_placeholder_thumbnails(self, video_path, max_thumbnails, thumbnail_size):
+        thumbnails = []
+        for index in range(max_thumbnails):
+            # QImageはスレッドセーフ（QPixmapはGUIスレッド専用のため使用不可）
+            image = QImage(thumbnail_size[0], thumbnail_size[1], QImage.Format_RGB888)
+            image.fill(QColor(255, 255, 255))
+            thumbnails.append(image)
+            self.thumbnail_ready.emit(index, image)
 
-        Returns:
-            Optional[VideoFeatures]: 動画の特徴量情報。OpenCVが利用できない場合はNone。
+        for progress in range(0, 101, max(1, 100 // max(1, max_thumbnails))):
+            self.progress_updated.emit(min(progress, 100))
+
+        self.digest_generated.emit(video_path, thumbnails)
+        return None
+
+    def _frame_to_image(self, frame, thumbnail_size) -> QImage:
+        """OpenCVフレームをQImageに変換（スレッドセーフ）。QPixmapはGUIスレッド専用なので使用禁止。"""
+        h_src, w_src = frame.shape[:2]
+        if h_src <= 0 or w_src <= 0:
+            img = QImage(thumbnail_size[0], thumbnail_size[1], QImage.Format_RGB888)
+            img.fill(QColor(30, 30, 30))
+            return img
+
+        tw, th = thumbnail_size
+        # アスペクト比を保ちながら収まる最大サイズを求める
+        scale = min(tw / w_src, th / h_src)
+        width = max(1, int(w_src * scale))
+        height = max(1, int(h_src * scale))
+
+        # INTER_AREA: 縮小に最適（高速かつ高品質）
+        resized = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+
+        if width == tw and height == th:
+            return QImage(rgb.tobytes(), width, height, rgb.strides[0], QImage.Format_RGB888)
+
+        # numpy キャンバスで余白合成（QPainter より軽量・スレッドセーフ）
+        canvas = _np.zeros((th, tw, 3), dtype=_np.uint8)
+        y0 = (th - height) // 2
+        x0 = (tw - width) // 2
+        canvas[y0:y0 + height, x0:x0 + width] = rgb
+        return QImage(canvas.tobytes(), tw, th, tw * 3, QImage.Format_RGB888)
+
+    def _make_burst_composite(
+        self,
+        key_image: QImage,
+        burst_list: list,
+        thumbnail_size: tuple,
+    ) -> QImage:
+        """キーフレーム + 前後バーストのフィルムストリップを合成した QImage を生成する（スレッドセーフ）。
+
+        burst_list: [(offset, ndarray), ...] offset 昇順・キーフレーム除く
         """
-        # フォールバック: OpenCVがない場合はプレースホルダー画像を返す
-        if not OPENCV_AVAILABLE:
-            # パラメータの決定
-            if max_thumbnails is None:
-                max_thumbnails = self.max_thumbnails
-            if thumbnail_size is None:
-                thumbnail_size = self.thumbnail_size
+        if not burst_list:
+            return key_image
 
-            try:
-                thumbnails = []
-                for i in range(max_thumbnails):
-                    pixmap = QPixmap(thumbnail_size[0], thumbnail_size[1])
-                    pixmap.fill()  # 空の（透明/白）pixmap
-                    thumbnails.append(pixmap)
+        key_w, key_h = thumbnail_size
+        n = len(burst_list)
+        strip_h = max(22, key_h // 3)
+        gap = 2
+        total_h = key_h + gap + strip_h
 
-                # 進捗を段階的に更新
-                for p in range(0, 101, max(1, 100 // max(1, max_thumbnails))):
-                    self.progress_updated.emit(min(p, 100))
+        canvas = QImage(key_w, total_h, QImage.Format_RGB888)
+        canvas.fill(QColor(0, 0, 0))
+        painter = QPainter(canvas)
 
-                # 最後にdigest_generatedを発行
-                self.digest_generated.emit(video_path, thumbnails)
-                return None
-            except Exception as e:
-                self.error_occurred.emit(f"プレースホルダーサムネイル生成に失敗しました: {e}")
-                return None
-        
-        if not self.is_video_file(video_path):
-            self.error_occurred.emit(f"動画ファイルではありません: {video_path}")
-            return None
-        
-        if not os.path.exists(video_path):
-            self.error_occurred.emit(f"ファイルが見つかりません: {video_path}")
-            return None
-        
-        # パラメータの設定
+        # キーフレーム（上部）
+        painter.drawImage(0, 0, key_image)
+
+        # セパレーター
+        painter.fillRect(0, key_h, key_w, gap, QColor(60, 60, 60))
+
+        # フィルムストリップ（各バーストフレームを等幅で配置）
+        frame_w = max(1, key_w // n)
+        for i, (offset, frame_array) in enumerate(burst_list):
+            x = i * frame_w
+            cell_w = frame_w if i < n - 1 else key_w - x  # 最後のセルは残り幅
+            img = self._frame_to_image(frame_array, (cell_w, strip_h))
+            painter.drawImage(x, key_h + gap, img)
+
+            # セル間の区切り線
+            if i > 0:
+                painter.fillRect(x, key_h + gap, 1, strip_h, QColor(80, 80, 80))
+
+        # キーフレーム位置マーカー（負 → 正 の境目、フィルムストリップ上部に細線）
+        pre_count = sum(1 for o, _ in burst_list if o < 0)
+        if 0 < pre_count < n:
+            marker_x = pre_count * frame_w
+            painter.fillRect(marker_x - 1, key_h + gap, 2, strip_h, QColor(255, 200, 0, 200))
+
+        painter.end()
+        return canvas
+
+    def generate_digest(self, video_path, max_thumbnails=None, thumbnail_size=None, burst_count=None) -> Optional[None]:
+        """サムネイルを生成してシグナル送出する。"""
         if max_thumbnails is None:
             max_thumbnails = self.max_thumbnails
         if thumbnail_size is None:
             thumbnail_size = self.thumbnail_size
-            
-        # 特徴量抽出
+        if burst_count is None:
+            burst_count = self.burst_count
+
+        if not OPENCV_AVAILABLE:
+            return self._emit_placeholder_thumbnails(video_path, max_thumbnails, thumbnail_size)
+
+        if not self.is_video_file(video_path):
+            self.error_occurred.emit(f"動画ファイルではありません: {video_path}")
+            return None
+        if not os.path.exists(video_path):
+            self.error_occurred.emit(f"ファイルが見つかりません: {video_path}")
+            return None
+
         try:
-            features = extract_video_features(
+            if burst_count == 0:
+                # 高速パス: キーフレームのみ（マウスオーバーサムネイルなど）
+                extracted_simple = extract_thumbnails_only(
+                    video_path,
+                    max_thumbnails=max_thumbnails,
+                    thumbnail_size=thumbnail_size,
+                    progress_callback=lambda v: self.progress_updated.emit(v),
+                )
+                if not extracted_simple:
+                    self.error_occurred.emit(f"サムネイル生成に失敗しました: {video_path}")
+                    return None
+                thumbnails = []
+                for index, (_, key_frame) in enumerate(extracted_simple):
+                    key_image = self._frame_to_image(key_frame, thumbnail_size)
+                    thumbnails.append(key_image)
+                    self.thumbnail_ready.emit(index, key_image)
+                self.progress_updated.emit(100)
+                self.digest_generated.emit(video_path, thumbnails)
+                return None
+
+            # バーストモード: アニメーション付きダイジェスト
+            extracted = extract_thumbnails_with_burst(
                 video_path,
                 max_thumbnails=max_thumbnails,
-                progress_callback=lambda p: self.progress_updated.emit(p)
+                thumbnail_size=thumbnail_size,
+                burst_count=burst_count,
+                progress_callback=lambda value: self.progress_updated.emit(value),
             )
-            if not features:
-                self.error_occurred.emit(f"動画の特徴量抽出に失敗しました: {video_path}")
+            if not extracted:
+                self.error_occurred.emit(f"サムネイル生成に失敗しました: {video_path}")
                 return None
-                
-            # サムネイル画像の生成
+
             thumbnails = []
-            cap = cv2.VideoCapture(video_path)
-            if not cap.isOpened():
-                self.error_occurred.emit(f"動画ファイルを開けませんでした: {video_path}")
-                return None
-                
-            try:
-                for pos in features.thumbnail_positions:
-                    frame_pos = int(pos * features.frame_count)
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_pos)
-                    ret, frame = cap.read()
-                    if not ret:
-                        continue
-                        
-                    # フレームをリサイズ
-                    aspect_ratio = frame.shape[1] / frame.shape[0]
-                    w = thumbnail_size[0]
-                    h = int(w / aspect_ratio)
-                    if h > thumbnail_size[1]:
-                        h = thumbnail_size[1]
-                        w = int(h * aspect_ratio)
-                    frame = cv2.resize(frame, (w, h))
-                    
-                    # BGR -> RGB変換
-                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    
-                    # QPixmapに変換
-                    qimg = QImage(frame.data, frame.shape[1], frame.shape[0],
-                                frame.strides[0], QImage.Format_RGB888)
-                    pixmap = QPixmap.fromImage(qimg)
-                    
-                    # 中央寄せでリサイズ
-                    if w != thumbnail_size[0] or h != thumbnail_size[1]:
-                        bg = QPixmap(thumbnail_size[0], thumbnail_size[1])
-                        bg.fill()
-                        x = (thumbnail_size[0] - w) // 2
-                        y = (thumbnail_size[1] - h) // 2
-                        painter = QPainter(bg)
-                        painter.drawPixmap(x, y, pixmap)
-                        painter.end()
-                        pixmap = bg
-                        
-                    thumbnails.append(pixmap)
-                    
-            finally:
-                cap.release()
-                
-            # サムネイル生成が完了したらシグナルを発行
-            self.digest_generated.emit(video_path, thumbnails)
-            return features
-                    
-        except Exception as e:
-            self.error_occurred.emit(f"サムネイル生成に失敗しました: {e}")
-            return None
-            
-            # 動画の情報を取得
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            duration = total_frames / fps if fps > 0 else 0
-            
-            if total_frames == 0:
-                self.error_occurred.emit("動画にフレームが含まれていません")
-                cap.release()
-                return
-            
-            # サムネイルを生成するフレーム位置を計算
-            frame_positions = []
-            if max_thumbnails == 1:
-                # 1つの場合は中央のフレーム
-                frame_positions = [total_frames // 2]
-            else:
-                # 複数の場合は等間隔で配置
-                step = total_frames // (max_thumbnails + 1)
-                frame_positions = [step * (i + 1) for i in range(max_thumbnails)]
-            
-            thumbnails = []
-            for i, frame_pos in enumerate(frame_positions):
-                # 進捗を更新
-                progress = int((i / len(frame_positions)) * 100)
-                self.progress_updated.emit(progress)
-                
-                # 指定されたフレームに移動
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_pos)
-                ret, frame = cap.read()
-                
-                if ret:
-                    # フレームをリサイズ
-                    resized_frame = cv2.resize(frame, thumbnail_size)
-                    
-                    # OpenCVのBGRからRGBに変換
-                    rgb_frame = cv2.cvtColor(resized_frame, cv2.COLOR_BGR2RGB)
-                    
-                    # QImageに変換
-                    h, w, ch = rgb_frame.shape
-                    bytes_per_line = ch * w
-                    qt_image = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format_RGB888)
-                    
-                    # QPixmapに変換
-                    pixmap = QPixmap.fromImage(qt_image)
-                    thumbnails.append(pixmap)
-                else:
-                    # フレームの読み込みに失敗した場合は空のQPixmapを追加
-                    empty_pixmap = QPixmap(thumbnail_size[0], thumbnail_size[1])
-                    empty_pixmap.fill()
-                    thumbnails.append(empty_pixmap)
-            
-            cap.release()
-            
-            # 進捗を100%に設定
+            for index, (_, key_frame, burst_list) in enumerate(extracted):
+                key_image = self._frame_to_image(key_frame, thumbnail_size)
+                pre_frames = [(off, f) for off, f in burst_list if off < 0]
+                post_frames = [(off, f) for off, f in burst_list if off > 0]
+                sequence: list[QImage] = [
+                    self._frame_to_image(f, thumbnail_size)
+                    for _, f in pre_frames[::ANIMATION_STEP]
+                ]
+                sequence.append(key_image)
+                sequence.extend(
+                    self._frame_to_image(f, thumbnail_size)
+                    for _, f in post_frames[::ANIMATION_STEP]
+                )
+                thumbnails.append(key_image)
+                self.thumbnail_sequence_ready.emit(index, sequence)
+
             self.progress_updated.emit(100)
-            
-            # ダイジェスト生成完了を通知
             self.digest_generated.emit(video_path, thumbnails)
-            
-        except Exception as e:
-            self.error_occurred.emit(f"ダイジェスト生成中にエラーが発生しました: {str(e)}")
-    
+        except Exception as exc:  # noqa: BLE001
+            self.error_occurred.emit(f"サムネイル生成に失敗しました: {exc}")
+        return None
+
     def get_video_info(self, video_path):
-        """動画の基本情報を取得"""
-        if not OPENCV_AVAILABLE:
+        """動画の基本情報を取得。"""
+        if not OPENCV_AVAILABLE or not self.is_video_file(video_path):
             return None
-        
-        if not self.is_video_file(video_path):
-            return None
-        
+
         try:
             cap = cv2.VideoCapture(video_path)
             if not cap.isOpened():
+                cap.release()
                 return None
-            
-            # 動画の情報を取得
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             fps = cap.get(cv2.CAP_PROP_FPS)
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            
             duration = total_frames / fps if fps > 0 else 0
-            
             cap.release()
-            
             return {
-                'duration': duration,
-                'fps': fps,
-                'width': width,
-                'height': height,
-                'total_frames': total_frames,
-                'file_size': os.path.getsize(video_path)
+                "duration": duration,
+                "fps": fps,
+                "width": width,
+                "height": height,
+                "total_frames": total_frames,
+                "file_size": os.path.getsize(video_path),
             }
-        except Exception as e:
+        except Exception:
             return None
 
 
 class VideoDigestWorker(QThread):
-    """動画ダイジェスト生成用のワーカースレッド"""
-    
-    def __init__(self, video_path, max_thumbnails=6, thumbnail_size=(160, 90), parent=None):
+    """動画ダイジェスト生成用ワーカー。"""
+
+    thumbnail_ready = Signal(int, QImage)        # QImage: スレッドセーフ
+    thumbnail_sequence_ready = Signal(int, list) # list[QImage]
+    digest_generated = Signal(str, list)
+    progress_updated = Signal(int)
+    error_occurred = Signal(str)
+
+    def __init__(self, video_path, max_thumbnails=6, thumbnail_size=(160, 90), burst_count=0, parent=None):
         super().__init__(parent)
         self.video_path = video_path
         self.max_thumbnails = max_thumbnails
         self.thumbnail_size = thumbnail_size
+        self.burst_count = burst_count
         self.generator = VideoDigestGenerator()
-        
-        # シグナルを接続
+        self.generator.thumbnail_ready.connect(self.thumbnail_ready)
+        self.generator.thumbnail_sequence_ready.connect(self.thumbnail_sequence_ready)
         self.generator.digest_generated.connect(self.digest_generated)
         self.generator.progress_updated.connect(self.progress_updated)
         self.generator.error_occurred.connect(self.error_occurred)
-    
+
     def run(self):
-        """スレッドの実行"""
         self.generator.generate_digest(
-            self.video_path, 
-            self.max_thumbnails, 
-            self.thumbnail_size
+            self.video_path,
+            self.max_thumbnails,
+            self.thumbnail_size,
+            self.burst_count,
         )
-    
-    # シグナルを転送
-    digest_generated = Signal(str, list)
-    progress_updated = Signal(int)
-    error_occurred = Signal(str)

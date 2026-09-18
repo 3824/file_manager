@@ -10,21 +10,28 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Signal, QThread, QTimer
 from PySide6.QtWidgets import QApplication
 
+from .logger import logger
+
 
 class DiskAnalyzer(QObject):
     """ディスク使用量分析クラス"""
-    
-    # シグナル定義
-    analysis_completed = Signal(list)  # 分析完了（フォルダ情報のリスト）
-    progress_updated = Signal(int)  # 進捗（0-100）
-    error_occurred = Signal(str)  # エラーメッセージ
-    
+
+    analysis_completed = Signal(list)
+    progress_updated = Signal(int)
+    error_occurred = Signal(str)
+    current_path_updated = Signal(str)  # 現在スキャン中のパス
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.max_depth = 3  # 最大分析深度
-        self.min_size_threshold = 1024 * 1024  # 1MB以下のフォルダは「その他」にまとめる
+        self.max_depth = 3
+        self.min_size_threshold = 1024 * 1024
         self._progress_total = 0
         self._progress_processed = 0
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        """スキャンをキャンセルする。"""
+        self._cancelled = True
     
     def _reset_progress(self, directory_path):
         try:
@@ -52,86 +59,85 @@ class DiskAnalyzer(QObject):
 
     def analyze_directory(self, directory_path):
         """指定ディレクトリの使用量を分析"""
+        self._cancelled = False
         if not os.path.isdir(directory_path):
             self.error_occurred.emit(f"ディレクトリが見つかりません: {directory_path}")
             return
 
         try:
             self._reset_progress(directory_path)
-            # ディレクトリ内のフォルダとファイルを分析
             folder_info = self._analyze_folder_recursive(directory_path, 0)
 
-            # 結果をソート（サイズの大きい順）
-            folder_info.sort(key=lambda x: x['size'], reverse=True)
+            if self._cancelled:
+                return
 
+            folder_info.sort(key=lambda x: x['size'], reverse=True)
             self.progress_updated.emit(100)
             self.analysis_completed.emit(folder_info)
 
         except Exception as e:
-            self.error_occurred.emit(f"分析中にエラーが発生しました: {str(e)}")
+            if not self._cancelled:
+                self.error_occurred.emit(f"分析中にエラーが発生しました: {str(e)}")
     
     def _analyze_folder_recursive(self, folder_path, current_depth):
         """フォルダを再帰的に分析"""
-        if current_depth > self.max_depth:
+        if self._cancelled or current_depth > self.max_depth:
             return []
-        
+
+        self.current_path_updated.emit(folder_path)
+
         try:
             folder_info_list = []
-            
-            # フォルダ内のアイテムを取得
-            items = []
+
             try:
-                for item in os.listdir(folder_path):
-                    item_path = os.path.join(folder_path, item)
-                    if os.path.exists(item_path):
-                        items.append(item_path)
+                items = [
+                    os.path.join(folder_path, item)
+                    for item in os.listdir(folder_path)
+                ]
             except PermissionError:
-                # アクセス権限がない場合はスキップ
                 return []
-            
-            # 各アイテムのサイズを計算
+
             for item_path in items:
+                if self._cancelled:
+                    return folder_info_list
+
                 try:
                     if os.path.isdir(item_path):
-                        # フォルダの場合
                         folder_size = self._calculate_folder_size(item_path)
-                        folder_name = os.path.basename(item_path)
-                        
                         folder_info = {
-                            'name': folder_name,
+                            'name': os.path.basename(item_path),
                             'path': item_path,
                             'size': folder_size,
                             'type': 'folder',
                             'depth': current_depth + 1,
-                            'children': self._analyze_folder_recursive(item_path, current_depth + 1) if current_depth < self.max_depth else []
+                            'children': (
+                                self._analyze_folder_recursive(item_path, current_depth + 1)
+                                if current_depth < self.max_depth else []
+                            ),
                         }
                         folder_info_list.append(folder_info)
                         self._increment_progress()
-                    
+
                     elif os.path.isfile(item_path):
-                        # ファイルの場合
-                        file_size = os.path.getsize(item_path)
-                        file_name = os.path.basename(item_path)
-                        
                         file_info = {
-                            'name': file_name,
+                            'name': os.path.basename(item_path),
                             'path': item_path,
-                            'size': file_size,
+                            'size': os.path.getsize(item_path),
                             'type': 'file',
                             'depth': current_depth + 1,
-                            'children': []
+                            'children': [],
                         }
                         folder_info_list.append(file_info)
                         self._increment_progress()
-                
+
                 except (OSError, PermissionError):
-                    # アクセスできないファイル/フォルダはスキップ
                     continue
-            
+
             return folder_info_list
-            
+
         except Exception as e:
-            print(f"フォルダ分析エラー ({folder_path}): {e}")
+            if not self._cancelled:
+                logger.debug(f"フォルダ分析エラー ({folder_path}): {e}")
             return []
     
     def _calculate_folder_size(self, folder_path):
@@ -139,16 +145,15 @@ class DiskAnalyzer(QObject):
         total_size = 0
         try:
             for dirpath, dirnames, filenames in os.walk(folder_path):
+                if self._cancelled:
+                    break
                 for filename in filenames:
                     try:
-                        file_path = os.path.join(dirpath, filename)
-                        if os.path.exists(file_path):
-                            total_size += os.path.getsize(file_path)
+                        total_size += os.path.getsize(os.path.join(dirpath, filename))
                     except (OSError, PermissionError):
                         continue
         except (OSError, PermissionError):
             pass
-        
         return total_size
     
     def get_drive_info(self, drive_path):
@@ -221,22 +226,24 @@ class DiskAnalyzer(QObject):
 
 class DiskAnalysisWorker(QThread):
     """ディスク分析用のワーカースレッド"""
-    
+
+    analysis_completed = Signal(list)
+    progress_updated = Signal(int)
+    error_occurred = Signal(str)
+    current_path_updated = Signal(str)
+
     def __init__(self, directory_path, parent=None):
         super().__init__(parent)
         self.directory_path = directory_path
         self.analyzer = DiskAnalyzer()
-        
-        # シグナルを接続
+
         self.analyzer.analysis_completed.connect(self.analysis_completed)
         self.analyzer.progress_updated.connect(self.progress_updated)
         self.analyzer.error_occurred.connect(self.error_occurred)
-    
+        self.analyzer.current_path_updated.connect(self.current_path_updated)
+
+    def cancel(self) -> None:
+        self.analyzer.cancel()
+
     def run(self):
-        """スレッドの実行"""
         self.analyzer.analyze_directory(self.directory_path)
-    
-    # シグナルを転送
-    analysis_completed = Signal(list)
-    progress_updated = Signal(int)
-    error_occurred = Signal(str)

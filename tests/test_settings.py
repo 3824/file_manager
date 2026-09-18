@@ -177,8 +177,11 @@ class TestFileManagerSettings:
             widget.attribute_colors["hidden"] = "#123456"
             
             # 設定を保存
+            # 構築時（ツールバー初期化等）の sync 呼び出しを除外し、
+            # save_settings 自体の sync 呼び出しだけを検証する
+            mock_settings_instance.sync.reset_mock()
             widget.save_settings()
-            
+
             # 保存が呼ばれたことを確認
             mock_settings_instance.setValue.assert_any_call("show_permissions", True)
             mock_settings_instance.setValue.assert_any_call("show_created", True)

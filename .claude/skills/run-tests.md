@@ -22,13 +22,13 @@ cd G:/project/file_manager && python -m pytest tests/test_simple.py tests/test_m
 UI関連の変更があった場合、またはフルテストが必要な場合:
 
 ```bash
-cd G:/project/file_manager && python -m pytest tests/test_button_actions.py tests/test_features.py tests/test_settings.py tests/test_run.py tests/test_video_thumbnail_preview.py -v -k "not test_tree_context_menu_triggers_duplicate" 2>&1 | tail -40
+cd G:/project/file_manager && python -m pytest tests/test_button_actions.py tests/test_features.py tests/test_settings.py tests/test_run.py tests/test_checkbox_functionality.py tests/test_keyboard_shortcuts.py -v -k "not test_tree_context_menu_triggers_duplicate" 2>&1 | tail -40
 ```
 
 **注意:**
-- `test_checkbox_detailed.py`, `test_checkbox_functionality.py`, `test_filename_similarity_dialog.py` は `pytest-qt` パッケージが必要（未インストール時はスキップ）
+- `test_checkbox_functionality.py`, `test_filename_similarity_dialog.py` は `pytest-qt` が必要（インストール済みなら通常実行）
 - `test_tree_context_menu_triggers_duplicate` は既知の失敗テスト（スキップ対象）
-- `test_file_manager_settings.py` はウィジェット生成でハングする可能性あり。UIテストを個別実行する場合は2分のタイムアウトを設定すること
+- `test_file_manager_settings.py` はウィジェット生成でハングする可能性あり
 
 ### Step 3: 新機能のテスト実行
 
@@ -80,17 +80,39 @@ def make_widget(qtbot):
     return _make
 ```
 
-### モック/モンキーパッチを使ったテスト
+### ダイアログのモック（重要）
+
+このプロジェクトのダイアログは `utils.py` の `silent_*` ヘルパーを使用している。
+テストで `QMessageBox.question` / `QMessageBox.information` をパッチしても効果がない。
+**必ず `silent_question` / `silent_information` 等をモジュール名前空間でパッチすること**:
+
 ```python
-def test_some_action(monkeypatch, qtbot):
-    called = {}
-    def fake_handler(self):
-        called["called"] = True
-    monkeypatch.setattr(fm.FileManagerWidget, "target_method", fake_handler)
-    widget = fm.FileManagerWidget()
-    qtbot.addWidget(widget)
-    widget.trigger_button.click()
-    assert called.get("called") is True
+# NG: QMessageBoxの静的メソッドをパッチしても silent_* には効かない
+monkeypatch.setattr(fm.QMessageBox, "question", ...)  # exec()がブロックしてハング
+
+# OK: 実際に呼ばれる silent_* 関数をパッチする
+monkeypatch.setattr(fm, "silent_question", lambda *a, **k: fm.QMessageBox.Yes)
+monkeypatch.setattr(fm, "silent_warning", lambda *a, **k: None)
+# またはunittest.mockで:
+patch("src.file_manager.filename_similarity_dialog.silent_question", return_value=QMessageBox.Yes)
+```
+
+このパッチを誤ると `mb.exec()` が永久にブロックしてテストがハングする。
+
+### 設定ダイアログテスト
+```python
+def test_settings_apply_button(monkeypatch, qtbot):
+    settings = QSettings("TestOrg", "TestApply")
+    dialog = fm.SettingsDialog(None, settings, {"name": True})
+    qtbot.addWidget(dialog)
+
+    persist_called = {}
+    monkeypatch.setattr(dialog, "_persist_settings", lambda: persist_called.update(called=True))
+
+    dialog.apply_button.click()
+
+    assert persist_called.get("called") is True
+    assert dialog.isVisible()  # ダイアログは閉じない
 ```
 
 ### 外部API（翻訳API等）のモックテスト
@@ -111,3 +133,4 @@ def test_translate_filename(monkeypatch):
 - ネットワーク依存のテスト（API呼び出し等）は必ずモックを使用し、実際のAPI呼び出しを行わない
 - Windows 環境で実行されるため、パス区切りに注意
 - テストファイルは `tests/test_<モジュール名>.py` に配置
+- 削除・確認ダイアログは `silent_*` ヘルパーを使うこと（`QMessageBox.question()` は音が鳴るため使用禁止）

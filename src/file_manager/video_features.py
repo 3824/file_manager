@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,6 +9,30 @@ from typing import Callable, List, Optional, Tuple
 import cv2
 import numpy as np
 from numpy.typing import NDArray
+
+# 新しい OpenCV 向け: VideoCapture.open() 時に av_log_set_level を呼び出させる
+os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "8")  # AV_LOG_FATAL 以上のみ表示
+
+
+@contextlib.contextmanager
+def _suppress_ffmpeg_stderr():
+    """FFmpeg が stderr に書き出す H.264/H.265 デコード警告を一時的に抑制する。
+
+    os.dup2 で fd 2 (stderr) を /dev/null にリダイレクトし、C レベルの
+    fprintf(stderr, ...) をキャプチャする。旧 OpenCV 向けのフォールバック。
+    """
+    try:
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        saved_fd = os.dup(2)
+        os.dup2(devnull_fd, 2)
+        os.close(devnull_fd)
+        try:
+            yield
+        finally:
+            os.dup2(saved_fd, 2)
+            os.close(saved_fd)
+    except OSError:
+        yield  # os.dup2 が使えない環境ではそのまま続行
 
 @dataclass
 class VideoFeatures:
@@ -102,6 +127,187 @@ def compute_frame_features(frame: NDArray[np.uint8]) -> Tuple[NDArray[np.float32
     
     return hist.astype(np.float32), features.astype(np.float32)
 
+
+def _calculate_positions(max_thumbnails: int) -> List[float]:
+    """サムネイル抽出位置を 0.0-1.0 で返す。"""
+    if max_thumbnails <= 1:
+        return [0.5]
+    step = 1.0 / (max_thumbnails + 1)
+    return [step * (i + 1) for i in range(max_thumbnails)]
+
+
+def _resize_to_thumbnail(
+    frame: NDArray[np.uint8],
+    thumbnail_size: tuple[int, int],
+) -> NDArray[np.uint8]:
+    """フレームを指定サムネイルサイズに収まるよう縮小する。"""
+    target_width, target_height = thumbnail_size
+    height, width = frame.shape[:2]
+    if height <= 0 or width <= 0:
+        return frame
+
+    aspect_ratio = width / height
+    resized_width = target_width
+    resized_height = int(resized_width / aspect_ratio)
+    if resized_height > target_height:
+        resized_height = target_height
+        resized_width = int(resized_height * aspect_ratio)
+
+    resized_width = max(1, resized_width)
+    resized_height = max(1, resized_height)
+    return cv2.resize(frame, (resized_width, resized_height), interpolation=cv2.INTER_AREA)
+
+
+def _calc_burst_interval(total_frames: int, max_thumbnails: int) -> int:
+    """バーストフレームの間隔を動画長・キーフレーム数から自動計算する。
+
+    キーフレーム間隔の約 1/3 を使い、広い時間範囲をカバーする。
+    最小 3 フレーム、最大 120 フレームでクランプ。
+    """
+    key_spacing = total_frames // max(1, max_thumbnails + 1)
+    return max(3, min(120, key_spacing // 3))
+
+
+def extract_thumbnails_only(
+    video_path: str | Path,
+    max_thumbnails: int = 6,
+    thumbnail_size: tuple[int, int] = (160, 90),
+    progress_callback: Optional[Callable[[int], None]] = None,
+) -> Optional[list[tuple[float, NDArray[np.uint8]]]]:
+    """サムネイル用フレームのみ抽出する。"""
+    if not cv2 or not np:
+        return None
+
+    path = str(video_path)
+    with _suppress_ffmpeg_stderr():
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            cap.release()
+            return None
+
+        try:
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if total_frames <= 0:
+                return None
+
+            positions = _calculate_positions(max_thumbnails)
+            results: list[tuple[float, NDArray[np.uint8]]] = []
+            for index, position in enumerate(positions):
+                frame_pos = int(position * total_frames)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_pos)
+                ret, frame = cap.read()
+                if ret:
+                    results.append((position, _resize_to_thumbnail(frame, thumbnail_size)))
+                if progress_callback:
+                    progress_callback(int(((index + 1) / len(positions)) * 100))
+            return results or None
+        except Exception:
+            return None
+        finally:
+            cap.release()
+
+def extract_thumbnails_with_burst(
+    video_path: str | Path,
+    max_thumbnails: int = 6,
+    thumbnail_size: tuple[int, int] = (160, 90),
+    burst_count: int = 2,
+    burst_interval_frames: Optional[int] = None,
+    progress_callback: Optional[Callable[[int], None]] = None,
+) -> Optional[list[tuple[float, NDArray[np.uint8], list[tuple[int, NDArray[np.uint8]]]]]]:
+    """各キーフレームとその前後バーストフレームを抽出する（高速版）。
+
+    - CAP_PROP_POS_MSEC でキーフレーム境界へシークするため高速
+    - cap.grab() でデコードせずにフレームをスキップするため高速
+    - 各バーストウィンドウ内は前向き読み取りのみで余分なシークなし
+
+    Returns:
+        list of (position, key_frame, burst_list)
+        burst_list: [(offset, frame), ...] offset < 0 = before, > 0 = after, offset 順にソート済み
+    """
+    if not cv2 or not np:
+        return None
+
+    path = str(video_path)
+    with _suppress_ffmpeg_stderr():
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            cap.release()
+            return None
+
+    try:
+        with _suppress_ffmpeg_stderr():
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames <= 0:
+            return None
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        # フレーム番号 → ミリ秒変換係数
+        ms_per_frame = 1000.0 / max(fps, 1e-9)
+
+        interval = burst_interval_frames if burst_interval_frames is not None \
+            else _calc_burst_interval(total_frames, max_thumbnails)
+
+        positions = _calculate_positions(max_thumbnails)
+        results: list[tuple[float, NDArray[np.uint8], list[tuple[int, NDArray[np.uint8]]]]] = []
+
+        for step, position in enumerate(positions):
+            key_no = int(position * total_frames)
+
+            # このキーフレームに必要な全フレーム番号を収集（offset 0 = キー）
+            needed: dict[int, int] = {key_no: 0}
+            for offset in range(-burst_count, burst_count + 1):
+                if offset == 0:
+                    continue
+                fn = max(0, min(total_frames - 1, key_no + offset * interval))
+                needed[fn] = offset
+
+            sorted_fns = sorted(needed.keys())
+
+            collected: dict[int, NDArray[np.uint8]] = {}
+            with _suppress_ffmpeg_stderr():
+                # 先頭フレームへミリ秒でシーク（Iフレーム境界へ移動するため高速）
+                cap.set(cv2.CAP_PROP_POS_MSEC, sorted_fns[0] * ms_per_frame)
+                current = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+
+                for target_fn in sorted_fns:
+                    skip = target_fn - current
+                    if skip < 0:
+                        # キーフレーム丸め込みで行き過ぎた場合のみ再シーク
+                        cap.set(cv2.CAP_PROP_POS_MSEC, target_fn * ms_per_frame)
+                        current = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+                        skip = target_fn - current
+
+                    # デコードせずスキップ（grab のみ = 高速）
+                    for _ in range(max(0, skip)):
+                        cap.grab()
+                    current = target_fn
+
+                    ret, frame = cap.read()
+                    current += 1
+                    if ret:
+                        collected[target_fn] = _resize_to_thumbnail(frame, thumbnail_size)
+
+            if progress_callback:
+                progress_callback(int((step + 1) / len(positions) * 100))
+
+            if key_no not in collected:
+                continue
+
+            burst_list: list[tuple[int, NDArray[np.uint8]]] = [
+                (offset, collected[fn])
+                for fn, offset in needed.items()
+                if offset != 0 and fn in collected
+            ]
+            burst_list.sort(key=lambda x: x[0])
+            results.append((position, collected[key_no], burst_list))
+
+        return results or None
+    except Exception:
+        return None
+    finally:
+        cap.release()
+
+
 def extract_video_features(
     video_path: str | Path,
     max_thumbnails: int = 6,
@@ -114,8 +320,9 @@ def extract_video_features(
     path = str(video_path)
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
+        cap.release()
         return None
-        
+
     try:
         # 基本情報の取得
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -128,11 +335,7 @@ def extract_video_features(
             return None
             
         # サムネイル位置の計算（0.0-1.0）
-        if max_thumbnails == 1:
-            positions = [0.5]
-        else:
-            step = 1.0 / (max_thumbnails + 1)
-            positions = [step * (i + 1) for i in range(max_thumbnails)]
+        positions = _calculate_positions(max_thumbnails)
             
         histograms = []
         features = []

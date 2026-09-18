@@ -21,7 +21,6 @@ setup(
     package_dir={"": "src"},
     packages=find_packages(where="src"),
     long_description_content_type="text/markdown",
-    packages=find_packages(),
     classifiers=[
         "Development Status :: 4 - Beta",
         "Intended Audience :: End Users/Desktop",
@@ -37,7 +36,7 @@ setup(
     install_requires=requirements,
     entry_points={
         "console_scripts": [
-            "gui-file-manager=main:main",
+            "gui-file-manager=file_manager.main:main",
         ],
     },
 )

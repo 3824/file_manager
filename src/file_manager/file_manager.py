@@ -1,28 +1,33 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 ファイルマネージャーのメインウィジェット
 """
 
 import os
+import shutil
+import stat
 import string
 import sys
+from functools import partial
 from pathlib import Path
 from PySide6.QtWidgets import (
-    QApplication, QWidget, QHBoxLayout, QVBoxLayout, QSplitter,
-    QTreeView, QListView, QHeaderView, QMessageBox,
-    QFileDialog, QInputDialog, QMenu, QAbstractItemView,
-    QToolBar, QComboBox, QLineEdit, QPushButton, QFileSystemModel,
-    QDialog, QFormLayout, QSpinBox, QFontComboBox, QCheckBox,
-    QGroupBox, QButtonGroup, QRadioButton, QTabWidget, QStyledItemDelegate,
-    QColorDialog, QLabel, QFrame, QProgressBar, QSizePolicy, QStyle,
-    QStyleOptionViewItem
+    QApplication, QWidget, QHBoxLayout, QVBoxLayout, QGridLayout, QSplitter,
+    QHeaderView, QMessageBox, QInputDialog, QMenu, QAbstractItemView,
+    QToolBar, QComboBox, QLineEdit, QPushButton, QDialog, QCheckBox,
+    QLabel, QFrame, QProgressBar, QSizePolicy, QStyle, QStackedWidget,
+    QColorDialog,
 )
 from PySide6.QtCore import (
-    Qt, QDir, QModelIndex, Signal, QSortFilterProxyModel, QTimer,
-    QSettings, QFileInfo, QAbstractItemModel, QObject
+    Qt, QDir, QTimer, QSettings, QFileInfo, QObject, QEvent, Signal, QItemSelectionModel
 )
-from PySide6.QtGui import QAction, QKeySequence, QIcon, QFont, QColor, QPalette
+from PySide6.QtGui import QAction, QKeySequence, QFont, QColor, QPalette, QShortcut
+
+try:
+    from .ui_theme import apply_theme as _apply_ui_theme
+    _UI_THEME_AVAILABLE = True
+except Exception:
+    _UI_THEME_AVAILABLE = False
 
 # 動画ダイジェスト関連のインポート
 try:
@@ -37,12 +42,20 @@ except ImportError:
 
 from .video_thumbnail_preview import VideoThumbnailPreview
 
+try:
+    from .video_player_window import VideoPlayerWindow
+    VIDEO_PLAYER_AVAILABLE = True
+except Exception:
+    VideoPlayerWindow = None  # type: ignore
+    VIDEO_PLAYER_AVAILABLE = False
+
 # ファイル検索関連のインポート
 try:
     from .file_search_dialog import FileSearchDialog
     FILE_SEARCH_AVAILABLE = True
 except ImportError:
     FILE_SEARCH_AVAILABLE = False
+
 # ディスク分析関連のインポート
 try:
     from .disk_analysis_dialog import DiskAnalysisDialog
@@ -56,7 +69,7 @@ try:
     VIDEO_DUPLICATES_AVAILABLE = True
 except ImportError:
     VIDEO_DUPLICATES_AVAILABLE = False
-    VideoDuplicatesDialog = None  # type: ignore[assignment]
+    VideoDuplicatesDialog = None  # type: ignore
 
 # ファイル名類似度検出関連のインポート
 try:
@@ -64,7 +77,20 @@ try:
     FILENAME_SIMILARITY_AVAILABLE = True
 except ImportError:
     FILENAME_SIMILARITY_AVAILABLE = False
-    FilenameSimilarityDialog = None  # type: ignore[assignment]
+    FilenameSimilarityDialog = None  # type: ignore
+
+try:
+    from .filename_translation import (
+        FilenameTranslationService,
+        TRANSLATION_API_ENV_KEY,
+    )
+    from .translate_preview_dialog import TranslatePreviewDialog
+    TRANSLATION_FEATURE_AVAILABLE = True
+except ImportError:
+    FilenameTranslationService = None  # type: ignore
+    TranslatePreviewDialog = None  # type: ignore
+    TRANSLATION_API_ENV_KEY = "TRANSLATION_API_KEY"
+    TRANSLATION_FEATURE_AVAILABLE = False
 
 # 同じファイルサイズ検出関連のインポート
 try:
@@ -72,670 +98,56 @@ try:
     SAME_FILESIZE_AVAILABLE = True
 except ImportError:
     SAME_FILESIZE_AVAILABLE = False
-    SameFileSizeDialog = None  # type: ignore[assignment]
+    SameFileSizeDialog = None  # type: ignore
 
-class CustomFileSystemModel(QFileSystemModel):
-    """カスタムファイルシステムモデル（追加列対応・チェックボックス選択機能付き）"""
-    
-    metadata_fetch_requested = Signal(str) # パス
+try:
+    from .video_digest_cache import VideoDigestCache
+except ImportError:
+    VideoDigestCache = None  # type: ignore
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.visible_columns = {
-            "name": True,
-            "size": True,
-            "type": True,
-            "modified": True,
-            "permissions": False,
-            "created": False,
-            "attributes": False,
-            "extension": False,
-            "owner": False,
-            "group": False,
-            "duration": True,
-            "resolution": True,
-            "fps": False
-        }
-        self.selected_files = set()  # 選択されたファイルのパスを管理
-        self.metadata_cache = {}
-        self.metadata_loading = set()
-    
-    def columnCount(self, parent=QModelIndex()):
-        """列数を返す"""
-        return 13  # 名前、サイズ、種類、更新日時、権限、作成日時、属性、拡張子、所有者、グループ, 再生時間, 解像度, FPS
-    
-    def headerData(self, section, orientation, role=Qt.DisplayRole):
-        """ヘッダーデータを返す"""
-        if orientation == Qt.Horizontal and role == Qt.DisplayRole:
-            headers = [
-                "名前", "サイズ", "種類", "更新日時", "権限", 
-                "作成日時", "属性", "拡張子", "所有者", "グループ",
-                "再生時間", "解像度", "FPS"
-            ]
-            if 0 <= section < len(headers):
-                return headers[section]
-        return super().headerData(section, orientation, role)
-    
-    def data(self, index, role=Qt.DisplayRole):
-        if not index.isValid():
-            return None
-        
-        file_info = self.fileInfo(index)
-        column = index.column()
-        
-        # チェックボックス機能（名前列のみ）
-        if column == 0 and role == Qt.CheckStateRole:
-            file_path = file_info.absoluteFilePath()
-            return Qt.Checked if file_path in self.selected_files else Qt.Unchecked
-        
-        # 標準列（0-3）は親クラスの実装を使用
-        if column < 4:
-            return super().data(index, role)
-        
-        # カスタム列の実装
-        if role == Qt.DisplayRole:
-            if column == 4:  # 権限
-                return self.get_permissions(file_info)
-            elif column == 5:  # 作成日時
-                try:
-                    # birthTime()が存在しない場合はcreated()を使用
-                    if hasattr(file_info, 'birthTime'):
-                        return file_info.birthTime().toString("yyyy/MM/dd hh:mm:ss")
-                    elif hasattr(file_info, 'created'):
-                        return file_info.created().toString("yyyy/MM/dd hh:mm:ss")
-                    else:
-                        return file_info.lastModified().toString("yyyy/MM/dd hh:mm:ss")
-                except Exception:
-                    return "不明"
-            elif column == 6:  # 属性
-                return self.get_attributes(file_info)
-            elif column == 7:  # 拡張子
-                return file_info.suffix()
-            elif column == 8:  # 所有者
-                return self.get_owner(file_info)
-            elif column == 9:  # グループ
-                return self.get_group(file_info)
-            elif column == 10: # 再生時間
-                meta = self.get_video_metadata(file_info)
-                if meta and isinstance(meta, dict):
-                    duration = meta.get('duration', 0)
-                    m, s = divmod(int(duration), 60)
-                    h, m = divmod(m, 60)
-                    return f"{h:02}:{m:02}:{s:02}"
-                return meta if meta == "Loading..." else ""
-            elif column == 11: # 解像度
-                meta = self.get_video_metadata(file_info)
-                if meta and isinstance(meta, dict):
-                    return f"{meta.get('width', 0)}x{meta.get('height', 0)}"
-                return meta if meta == "Loading..." else ""
-            elif column == 12: # FPS
-                meta = self.get_video_metadata(file_info)
-                if meta and isinstance(meta, dict):
-                    return f"{meta.get('fps', 0):.2f}"
-                return meta if meta == "Loading..." else ""
-        
-        return None
-    
-    def setData(self, index, value, role=Qt.EditRole):
-        """データを設定"""
-        if not index.isValid():
-            return False
-        file_info = self.fileInfo(index)
-        column = index.column()
-        # チェックボックス機能（名前列のみ）
-        if column == 0 and role == Qt.CheckStateRole:
-            file_path = file_info.absoluteFilePath()
-            if value == Qt.Checked:
-                self.selected_files.add(file_path)
-            else:
-                self.selected_files.discard(file_path)
-            self.dataChanged.emit(index, index, [Qt.CheckStateRole])
-            return True
-        return super().setData(index, value, role)
-    
-    def flags(self, index):
-        """アイテムのフラグを返す"""
-        if not index.isValid():
-            return Qt.NoItemFlags
-        column = index.column()
-        # 名前列にチェックボックス機能を追加
-        if column == 0:
-            return super().flags(index) | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable
-        return super().flags(index)
-    
-    def get_selected_files(self):
-        """選択されたファイルのリストを取得"""
-        return list(self.selected_files)
-    
-    def clear_selection(self):
-        """選択をクリア"""
-        self.selected_files.clear()
-        # 全データの変更を通知
-        if self.rowCount() > 0:
-            self.dataChanged.emit(
-                self.index(0, 0),
-                self.index(self.rowCount() - 1, self.columnCount() - 1),
-                [Qt.CheckStateRole]
-            )
-    
-    def select_all_files(self):
-        """全てのファイルを選択"""
-        self.selected_files.clear()
-        for row in range(self.rowCount()):
-            index = self.index(row, 0)
-            file_info = self.fileInfo(index)
-            if not file_info.isDir():  # ファイルのみ選択
-                self.selected_files.add(file_info.absoluteFilePath())
-        
-        # 全データの変更を通知
-        if self.rowCount() > 0:
-            self.dataChanged.emit(
-                self.index(0, 0),
-                self.index(self.rowCount() - 1, self.columnCount() - 1),
-                [Qt.CheckStateRole]
-            )
-    
-    def get_selected_count(self):
-        """選択されたファイル数を取得"""
-        return len(self.selected_files)
-    
-    def get_permissions(self, file_info):
-        """権限文字列を取得"""
-        try:
-            permissions = file_info.permissions()
-            perm_str = ""
+# 動画クラスタリング関連のインポート
+try:
+    from .video_cluster_db import VideoClusterDB
+    from .video_cluster_dialog import VideoClusterScanDialog, VideoClusterBrowserDialog
+    VIDEO_CLUSTER_AVAILABLE = True
+except Exception:
+    VideoClusterDB = None  # type: ignore
+    VideoClusterScanDialog = None  # type: ignore
+    VideoClusterBrowserDialog = None  # type: ignore
+    VIDEO_CLUSTER_AVAILABLE = False
 
-            # 読み取り権限
-            perm_str += "r" if permissions & QFileInfo.Permission.ReadUser else "-"
-            perm_str += "w" if permissions & QFileInfo.Permission.WriteUser else "-"
-            perm_str += "x" if permissions & QFileInfo.Permission.ExeUser else "-"
-            
-            # グループ権限
-            perm_str += "r" if permissions & QFileInfo.Permission.ReadGroup else "-"
-            perm_str += "w" if permissions & QFileInfo.Permission.WriteGroup else "-"
-            perm_str += "x" if permissions & QFileInfo.Permission.ExeGroup else "-"
-            
-            # その他権限
-            perm_str += "r" if permissions & QFileInfo.Permission.ReadOther else "-"
-            perm_str += "w" if permissions & QFileInfo.Permission.WriteOther else "-"
-            perm_str += "x" if permissions & QFileInfo.Permission.ExeOther else "-"
-            
-            return perm_str
-        except:
-            return "---------"
 
-    def get_video_metadata(self, file_info):
-        """動画メタデータを取得（キャッシュまたは非同期取得）"""
-        path = file_info.absoluteFilePath()
-        
-        # 動画ファイルでない場合は空文字
-        video_extensions = {'.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v', '.3gp', '.mpg', '.mpeg'}
-        if file_info.suffix().lower() not in [ext.lstrip('.') for ext in video_extensions]:
-            return None
+from .logger import logger
+from .qt_models import RenameSummary, CustomFileSystemModel, FileSortFilterProxyModel, VideoMetadataWorker
+from .views import FileListView, FileItemDelegate, _SplitterCollapseFilter
+from .left_pane import LeftPaneWidget
+from .settings_dialog import SettingsDialog
+from .utils import coerce_bool, coerce_int, coerce_str, coerce_color, silent_question, silent_warning, silent_information
+from .constants import TOOLBAR_ALL_ITEMS, TOOLBAR_DEFAULT_ORDER, normalize_toolbar_order
 
-        # キャッシュにあれば返す
-        if hasattr(self, 'metadata_cache') and path in self.metadata_cache:
-            return self.metadata_cache[path]
-        
-        # キャッシュになく、取得中でなければリクエスト
-        if hasattr(self, 'metadata_loading') and path not in self.metadata_loading:
-             self.request_metadata_fetch(path)
-             self.metadata_loading.add(path)
-        
-        return "Loading..."
 
-    def request_metadata_fetch(self, path):
-        """メタデータ取得リクエストを発行（シグナル経由などでメインウィンドウのWorkerにつなぐ想定）"""
-        # モデル単体ではスレッド管理が難しいため、シグナルを発行して親に委譲するのが一般的だが、
-        # ここでは簡易的に管理用のシグナルを定義してemitする形にする
-        if hasattr(self, 'metadata_fetch_requested'):
-            self.metadata_fetch_requested.emit(path)
+def _rename_file_without_overwrite(source: Path, target: Path) -> None:
+    """既存ファイルを上書きせず、同じディレクトリ内で名前を変更する。"""
+    source = Path(source)
+    target = Path(target)
+    if os.path.normcase(os.path.abspath(source)) == os.path.normcase(os.path.abspath(target)):
+        return
+    if os.path.lexists(target):
+        raise FileExistsError(f"同名ファイルが既に存在します: {target.name}")
 
-    def update_metadata(self, path, metadata):
-        """非同期取得完了後のコールバック"""
-        if hasattr(self, 'metadata_loading') and path in self.metadata_loading:
-            self.metadata_loading.remove(path)
-        
-        if not hasattr(self, 'metadata_cache'):
-            self.metadata_cache = {}
-            
-        self.metadata_cache[path] = metadata
-        
-        # モデルの更新を通知
-        index = self.index(path)
-        if index.isValid():
-            # 10, 11, 12列目が更新されたとみなす
-            self.dataChanged.emit(index.sibling(index.row(), 10), index.sibling(index.row(), 12), [Qt.DisplayRole])
-    
-    def get_attributes(self, file_info):
-        """属性文字列を取得"""
-        attributes = []
-        
-        if file_info.isHidden():
-            attributes.append("隠し")
-        if not file_info.isWritable():
-            attributes.append("読み取り専用")
-        # isSystem()はPySide6では削除されているため、代替手段を使用
-        if file_info.isSymLink():
-            attributes.append("シンボリックリンク")
-        
-        return ", ".join(attributes) if attributes else "通常"
-    
-    def get_owner(self, file_info):
-        """所有者を取得"""
-        try:
-            path = file_info.absoluteFilePath()
-            if sys.platform != "win32":
-                import os
-                import pwd
-                stat_info = os.stat(path, follow_symlinks=False)
-                owner = pwd.getpwuid(stat_info.st_uid).pw_name
-                return owner
-            else:
-                # Windows環境では簡易的に固定表記
-                return "User"
-        except Exception:
-            return "Unknown"
-    
-    def get_group(self, file_info):
-        """グループを取得"""
-        try:
-            path = file_info.absoluteFilePath()
-            if sys.platform != "win32":
-                import os
-                import grp
-                stat_info = os.stat(path, follow_symlinks=False)
-                group = grp.getgrgid(stat_info.st_gid).gr_name
-                return group
-            else:
-                # Windows環境では簡易的に固定表記
-                return "Users"
-        except Exception:
-            return "Unknown"
-    
-    def get_attribute_color(self, file_info):
-        """属性に基づく色を取得"""
-        if file_info.isHidden():
-            return QColor("#808080")  # グレー
-        elif not file_info.isWritable():
-            return QColor("#0000FF")  # 青
-        elif file_info.isSymLink():
-            return QColor("#FF0000")  # 赤（シンボリックリンク）
-        else:
-            return QColor("#000000")  # 黒（通常）
-    
-    def update_visible_columns(self, visible_columns):
-        """表示列設定を更新"""
-        # Copy the settings immediately, but perform the model reset on the
-        # Qt event loop to avoid re-entrancy into QFileSystemModel internals
-        # which may cause native crashes on some platforms.
-        try:
-            self.visible_columns = visible_columns.copy()
-        except Exception:
-            # best-effort copy
-            try:
-                self.visible_columns = dict(visible_columns)
-            except Exception:
-                self.visible_columns = visible_columns
+    if os.name == "nt":
+        # Windows の os.rename は既存の宛先を上書きしない。
+        os.rename(source, target)
+        return
 
-        def _reset():
-            try:
-                # beginResetModel/endResetModel is safer than emitting
-                # layoutChanged while the model is being used by views.
-                try:
-                    self.beginResetModel()
-                except Exception:
-                    pass
-                try:
-                    self.endResetModel()
-                except Exception:
-                    pass
+    # POSIX の os.rename は上書きするため、ハードリンク作成の排他性を利用する。
+    os.link(source, target, follow_symlinks=False)
+    try:
+        os.unlink(source)
+    except Exception:
+        os.unlink(target)
+        raise
 
-            except Exception:
-                # Fallback: try emitting layoutChanged if reset isn't available
-                try:
-                    self.layoutChanged.emit()
-                except Exception:
-                    pass
-
-        try:
-            QTimer.singleShot(0, _reset)
-        except Exception:
-            # last-resort immediate reset
-            _reset()
-
-class FileSortFilterProxyModel(QSortFilterProxyModel):
-    """サイズ列を数値としてソートするためのプロキシモデル"""
-
-    def lessThan(self, left, right):
-        try:
-            # サイズ列（1列目）は数値で比較
-            if left.column() == 1 and right.column() == 1 and hasattr(self.sourceModel(), 'fileInfo'):
-                source_model = self.sourceModel()
-                left_info = source_model.fileInfo(left)
-                right_info = source_model.fileInfo(right)
-
-                left_size = left_info.size() if left_info.isFile() else 0
-                right_size = right_info.size() if right_info.isFile() else 0
-
-                return left_size < right_size
-        except Exception:
-            # 何かあれば既定の比較にフォールバック
-            pass
-
-        # それ以外の列は既定の比較を利用
-        return super().lessThan(left, right)
-
-class LeftPaneWidget(QWidget):
-    """左ペインウィジェット（ドライブボタン + フォルダツリー）"""
-    
-    drive_selected = Signal(str)  # ドライブが選択された時のシグナル
-    
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.current_drive = None
-        self.drive_buttons = {}
-        self.drive_button_group = QButtonGroup(self)
-        self.drive_button_group.setExclusive(True)
-        self.worker_thread = None
-        self.worker = None
-        self.init_ui()
-        self.setup_folder_tree()
-        self.setup_drive_buttons()
-
-    
-    def cleanup_worker(self):
-        """ワーカースレッドのクリーンアップ"""
-        if getattr(self, 'worker_thread', None) is not None and hasattr(self.worker_thread, 'isRunning'):
-            if self.worker_thread.isRunning():
-                self.worker_thread.quit()
-                if not self.worker_thread.wait(3000):
-                    self.worker_thread.terminate()
-                    self.worker_thread.wait(3000)
-        if getattr(self, 'worker', None) is not None:
-            self.worker.deleteLater()
-            self.worker = None
-        if getattr(self, 'worker_thread', None) is not None:
-            self.worker_thread.deleteLater()
-            self.worker_thread = None
-
-    def closeEvent(self, event):
-        """ウィジェットが閉じられる時のクリーンアップ"""
-        self.cleanup_worker()
-        if self._qt_available:
-            super().closeEvent(event)
-    
-    def init_ui(self):
-        """UIの初期化"""
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(5, 5, 5, 5)
-        layout.setSpacing(5)
-        
-        # ドライブボタンエリア
-        self.drive_frame = QFrame()
-        self.drive_frame.setFrameStyle(QFrame.StyledPanel)
-        self.drive_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        drive_layout = QVBoxLayout(self.drive_frame)
-        drive_layout.setContentsMargins(6, 6, 6, 6)
-        drive_layout.setSpacing(4)
-
-        drive_label = QLabel("ドライブ:")
-        drive_label.setStyleSheet("font-size: 10px;")
-        drive_layout.addWidget(drive_label)
-
-        # ドライブボタンコンテナ
-        self.drive_container = QWidget()
-        self.drive_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.drive_buttons_layout = QHBoxLayout(self.drive_container)
-        self.drive_buttons_layout.setContentsMargins(0, 0, 0, 0)
-        self.drive_buttons_layout.setSpacing(4)
-
-        drive_layout.addWidget(self.drive_container)
-        
-        layout.addWidget(self.drive_frame)
-        
-        # フォルダツリーエリア
-        self.tree_frame = QFrame()
-        self.tree_frame.setFrameStyle(QFrame.StyledPanel)
-        tree_layout = QVBoxLayout(self.tree_frame)
-        tree_layout.setContentsMargins(5, 5, 5, 5)
-        
-        tree_layout.addWidget(QLabel("フォルダ:"))
-        
-        # プログレスバー
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        self.progress_bar.setRange(0, 0)  # 不定プログレスバー
-        self.progress_bar.setFixedHeight(20)
-        tree_layout.addWidget(self.progress_bar)
-        
-        # フォルダツリー
-        self.tree_view = QTreeView()
-        self.tree_view.setHeaderHidden(True)
-        self.tree_view.setRootIsDecorated(True)
-        self.tree_view.setAlternatingRowColors(True)
-        self.tree_view.setAnimated(True)
-        self.tree_view.setIndentation(20)
-        self.tree_view.setSortingEnabled(False)
-        self.tree_view.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.tree_view.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.tree_view.setExpandsOnDoubleClick(True)
-        
-        tree_layout.addWidget(self.tree_view)
-        layout.addWidget(self.tree_frame)
-        
-        # レイアウトの比率設定
-        layout.setStretchFactor(self.drive_frame, 0)
-        layout.setStretchFactor(self.tree_frame, 1)
-    
-    def setup_drive_buttons(self):
-        """ドライブボタンの設定"""
-        # 既存ボタンをクリア
-        for button in list(self.drive_buttons.values()):
-            self.drive_buttons_layout.removeWidget(button)
-            self.drive_button_group.removeButton(button)
-            button.deleteLater()
-        self.drive_buttons.clear()
-
-        # 利用可能なドライブを取得
-        available_drives = self.get_available_drives()
-
-        for drive in available_drives:
-            button = QPushButton(drive)
-            button.setCheckable(True)
-            button.setMinimumWidth(48)
-            button.setMaximumWidth(72)
-            button.setFixedHeight(24)
-            button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-            button.setStyleSheet("font-size: 9px; padding: 2px 6px;")
-            self.drive_button_group.addButton(button)
-            button.clicked.connect(lambda checked, d=drive: self.on_drive_selected(d))
-            self.drive_buttons[drive] = button
-            self.drive_buttons_layout.addWidget(button)
-
-        # 初期状態として最初のドライブを選択
-        if available_drives:
-            self.select_drive(available_drives[0])
-
-    def _update_drive_button_state(self, drive: str | None) -> None:
-        """drive ボタンのチェック状態を更新"""
-        for btn_drive, button in self.drive_buttons.items():
-            button.setChecked(btn_drive == drive)
-
-    def take_drive_widget(self):
-        """ドライブエリアを外部レイアウトに移動するためのヘルパー"""
-        if not hasattr(self, "drive_frame"):
-            return None
-
-        layout = self.layout()
-        if layout is not None:
-            layout.removeWidget(self.drive_frame)
-
-        self.drive_frame.setParent(None)
-
-        if layout is not None and hasattr(self, "tree_frame"):
-            layout.setStretchFactor(self.tree_frame, 1)
-
-        return self.drive_frame
-
-    def get_available_drives(self):
-        """利用可能なドライブを取得"""
-        drives = []
-        if sys.platform == "win32":
-            # Windowsの場合
-            import string
-            for letter in string.ascii_uppercase:
-                drive_path = f"{letter}:\\"
-                if os.path.exists(drive_path):
-                    drives.append(letter)
-        else:
-            # Unix系の場合
-            drives = ["/"]
-            # マウントポイントを取得
-            try:
-                with open('/proc/mounts', 'r') as f:
-                    for line in f:
-                        parts = line.split()
-                        if len(parts) >= 2:
-                            mount_point = parts[1]
-                            if mount_point.startswith('/') and mount_point != '/':
-                                drives.append(mount_point)
-            except:
-                pass
-        
-        return drives
-    
-    def setup_folder_tree(self):
-        """フォルダツリーの設定"""
-        # フォルダのみのモデル
-        self.folder_model = QFileSystemModel()
-        self.folder_model.setRootPath("")
-        self.folder_model.setFilter(QDir.AllDirs | QDir.NoDotAndDotDot)
-        
-        self.tree_view.setModel(self.folder_model)
-        
-        # ヘッダー設定
-        header = self.tree_view.header()
-        header.setStretchLastSection(True)
-        header.setSectionResizeMode(0, QHeaderView.Interactive)
-        header.setMinimumSectionSize(100)
-        header.setDefaultSectionSize(200)
-        
-        # 不要な列を非表示
-        for i in range(1, self.folder_model.columnCount()):
-            self.tree_view.hideColumn(i)
-    
-    def show_progress(self, message="読み込み中..."):
-        """プログレスバーを表示"""
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setFormat(message)
-        self.tree_view.setEnabled(False)
-        # ドライブボタンも無効化
-        for button in self.drive_buttons.values():
-            button.setEnabled(False)
-    
-    def hide_progress(self):
-        """プログレスバーを非表示"""
-        self.progress_bar.setVisible(False)
-        self.tree_view.setEnabled(True)
-        # ドライブボタンを再有効化
-        for button in self.drive_buttons.values():
-            button.setEnabled(True)
-    
-    def on_drive_selected(self, drive):
-        """ドライブが選択された時の処理"""
-        self._update_drive_button_state(drive)
-        self.select_drive_async(drive)
-    
-    def select_drive_async(self, drive):
-        """非同期でドライブを選択"""
-        self.current_drive = drive  # ドライブを設定
-        self._update_drive_button_state(drive)
-        
-        if sys.platform == "win32":
-            drive_path = f"{drive}:\\"
-        else:
-            drive_path = drive
-        
-        # プログレスバーを表示
-        self.show_progress(f"ドライブ {drive} を読み込み中...")
-        
-        # QTimerを使用して非同期風に処理
-        QTimer.singleShot(100, lambda: self.load_drive_sync(drive_path))
-    
-    def load_drive_sync(self, drive_path):
-        """同期でドライブを読み込み"""
-        try:
-            # ドライブの存在確認
-            if not os.path.exists(drive_path):
-                raise FileNotFoundError(f"ドライブが見つかりません: {drive_path}")
-            
-            # フォルダモデルが存在することを確認
-            if not hasattr(self, 'folder_model'):
-                self.hide_progress()
-                return
-            
-            # フォルダツリーのルートを設定
-            root_index = self.folder_model.index(drive_path)
-            if root_index.isValid():
-                self.tree_view.setRootIndex(root_index)
-                self.tree_view.expand(root_index)
-            self._update_drive_button_state(self.current_drive)
-            self.hide_progress()
-            self.drive_selected.emit(self.current_drive)
-
-        except Exception as e:
-            self.hide_progress()
-            QMessageBox.warning(self, "エラー", f"ドライブの読み込みに失敗しました:\n{str(e)}")
-    
-    def select_drive(self, drive):
-        """ドライブを選択"""
-        # ボタンの状態を更新
-        self._update_drive_button_state(drive)
-        self.current_drive = drive
-        
-        # フォルダモデルが存在することを確認
-        if not hasattr(self, 'folder_model'):
-            return
-        
-        # フォルダツリーのルートを設定
-        if sys.platform == "win32":
-            drive_path = f"{drive}:\\"
-        else:
-            drive_path = drive
-        
-        if os.path.exists(drive_path):
-            root_index = self.folder_model.index(drive_path)
-            if root_index.isValid():
-                self.tree_view.setRootIndex(root_index)
-                self.tree_view.expand(root_index)
-    
-    def get_selected_path(self):
-        """現在選択されているパスを取得"""
-        if not hasattr(self, 'folder_model'):
-            return None
-        
-        current_index = self.tree_view.currentIndex()
-        if current_index.isValid():
-            return self.folder_model.filePath(current_index)
-        return None
-
-class VideoMetadataWorker(QObject):
-    """動画メタデータを非同期で取得するワーカー"""
-    metadata_ready = Signal(str, dict)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.generator = VideoDigestGenerator()
-
-    def fetch_metadata(self, path):
-        """メタデータを取得してシグナルで返す"""
-        # ここは別スレッドで実行される想定
-        info = self.generator.get_video_info(path)  # video_digest.py にあるメソッド
-        if info:
-            self.metadata_ready.emit(path, info)
-        else:
-            self.metadata_ready.emit(path, {"error": "Failed"})
 
 class FileManagerWidget(QWidget):
     COLUMN_WIDTHS_KEY = "column_widths"
@@ -755,6 +167,9 @@ class FileManagerWidget(QWidget):
         ("fps", 12),
     ]
 
+    # ステータスバーなど外部コンポーネントへの選択変化通知
+    selection_changed = Signal()
+
     DEFAULT_COLUMN_WIDTHS = {
         "name": 260,
         "size": 120,
@@ -771,11 +186,6 @@ class FileManagerWidget(QWidget):
         "fps": 60,
     }
 
-    def apply_settings(self):
-        """エイリアス: テスト互換のため"""
-        return self.load_settings()
-    """ファイルマネージャーのメインウィジェット"""
-    
     def __init__(self, parent=None):
         self._owns_app = False
         self._owned_qapplication = None
@@ -784,7 +194,6 @@ class FileManagerWidget(QWidget):
         if self._qt_available:
             app_instance = QApplication.instance()
             if app_instance is None:
-                # ヘッドレス環境ではオフスクリーンプラットフォームを使用
                 if (
                     sys.platform.startswith("linux")
                     and not os.environ.get("DISPLAY")
@@ -798,23 +207,20 @@ class FileManagerWidget(QWidget):
                 self._owns_app = True
                 app_instance = QApplication.instance()
 
-            # QApplicationを保持しておく（GC対策）
             self._owned_qapplication = app_instance
-
             super().__init__(parent)
         else:
-            # テスト用モック環境ではQWidget初期化をスキップ
             pass
 
         if not self._owned_qapplication and self._qt_available:
             self._owned_qapplication = QApplication.instance()
+
         self.current_path = QDir.homePath()
         self.settings = self._create_settings()
-        self.view_mode = "list"  # "list" or "detail"
-        self.show_hidden = False  # 隠しファイル表示フラグ
-        # 設定から表示列を読み込み（デフォルト値を統一）
+        self.view_mode = "list"
+        self.show_hidden = True
         self.visible_columns = {
-            "name": True,  # 名前列は常に表示
+            "name": True,
             "size": True,
             "type": True,
             "modified": True,
@@ -828,166 +234,152 @@ class FileManagerWidget(QWidget):
             "resolution": True,
             "fps": False
         }
-        # ファイル属性による色設定
         self.attribute_colors = {
-            "hidden": "#808080",      # グレー
-            "readonly": "#0000FF",    # 青
-            "system": "#FF0000",      # 赤
-            "normal": "#000000"       # 黒
+            "hidden": "#808080",
+            "readonly": "#0000FF",
+            "system": "#FF0000",
+            "normal": "#000000"
         }
         self.worker_thread = None
         self.worker = None
-        
-        # メタデータ取得用スレッドプール/ワーカー
-        from PySide6.QtCore import QThreadPool
-        self.thread_pool = QThreadPool()
-        if VIDEO_DIGEST_AVAILABLE:
-            self.metadata_worker = VideoMetadataWorker() # ワーカーインスタンス（ロジック保持用）
-            self.metadata_worker.metadata_ready.connect(self._on_metadata_ready)
-        else:
-            self.metadata_worker = None
+        self._nav_history: list[str] = []
+        self._nav_forward_stack: list[str] = []
+        self._nav_jumping = False
+        self._syncing_left_pane = False
+        self._clipboard_paths: list[str] = []
+        self._clipboard_move = False
 
-        self.video_digest_generator = VideoDigestGenerator() if VIDEO_DIGEST_AVAILABLE else None
+        self.thread_pool = None
+        self.metadata_worker = None
+        self.video_digest_generator = None
         self._opencv_warning_shown = False
         self.thumbnail_preview = None
+
+        # 動画クラスタリング
+        self._cluster_db: "VideoClusterDB | None" = None
+        self._active_tag_filter: list[str] = []
         self.video_thumbnail_count = 6
         self.video_thumbnail_size = (160, 90)
         self.video_auto_show_digest = False
-        # まず設定を読み込み
+        self.video_digest_trigger = "none"
+        self.video_hover_thumbnail_enabled = False
+        self.video_digest_max_frames = 12
+        self.video_digest_cache_size_mb = 200
+        self.video_player_enabled = True
+        self.video_player_default_speed = 1.0
+        self.video_player_default_muted = True
+        self.video_player_autoplay = True
+        self._video_player_window = None
+        self.filter_foreign_filenames = False
+
         self.load_settings()
 
-        # 前回終了時のフォルダを復元
         try:
             last_path = self.settings.value("last_path", "", type=str)
             if last_path and os.path.isdir(last_path):
                 self.current_path = last_path
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Failed to load last_path: {e}")
         
         if self._qt_available:
-            # UIを初期化
             self.init_ui()
             self.setup_models()
             self.connect_signals()
             self.setup_context_menus()
             self.setup_custom_delegate()
-
-            # 最後に設定を適用（UIが準備完了してから）
+            self._setup_shortcuts()
             self.load_settings()
 
-            # 左ペインの前回選択状態を復元
             try:
-                last_left = self.settings.value("last_left_path", "", type=str)
-                last_drive = self.settings.value("last_drive", "", type=str)
-                if last_drive and hasattr(self, 'left_pane'):
-                    # ドライブを選択するとツリーがロードされる
-                    self.left_pane.select_drive(last_drive)
-                if last_left and hasattr(self, 'left_pane') and hasattr(self.left_pane, 'folder_model'):
-                    # ツリー上でそのパスを選択
-                    idx = self.left_pane.folder_model.index(last_left)
-                    if idx.isValid():
-                        self.left_pane.tree_view.setCurrentIndex(idx)
-                        # ルートを展開して見えるようにする
-                        self.left_pane.tree_view.expand(idx)
-                        # 右ペインもそのパスを表示
-                        self.set_current_path(last_left)
-            except Exception:
-                pass
+                self.setup_detail_view()
+            except Exception as e:
+                logger.error(f"Failed to setup detail view: {e}")
 
-    @staticmethod
-    def _create_settings():
-        """QSettingsインスタンスを生成"""
-        from PySide6 import QtCore  # 遅延インポートでテストを容易にする
+            self._restore_splitter_state()
 
-        return QtCore.QSettings("FileManager", "Settings")
+            try:
+                restore_path = self.settings.value("last_path", "", type=str)
+                if restore_path and os.path.isdir(restore_path):
+                    if sys.platform == "win32" and hasattr(self, 'left_pane'):
+                        drive, _ = os.path.splitdrive(restore_path)
+                        if drive:
+                            self.left_pane.select_drive(drive.rstrip(":"))
+                    self.set_current_path(restore_path)
+            except Exception as e:
+                logger.debug(f"Failed to restore path on startup: {e}")
 
-    @staticmethod
-    def _coerce_bool(value, default):
-        """設定値を真偽値に変換"""
-        if isinstance(value, bool):
-            return value
-        if value is None:
-            return default
-        if isinstance(value, str):
-            lowered = value.strip().lower()
-            if lowered in {"true", "1", "yes", "on"}:
-                return True
-            if lowered in {"false", "0", "no", "off"}:
-                return False
-            return default
-        if isinstance(value, (int, float)):
-            return bool(value)
-        return default
+    def apply_settings(self):
+        """エイリアス: テスト互換のため"""
+        return self.load_settings()
 
-    @staticmethod
-    def _coerce_int(value, default, *, minimum=None, maximum=None):
-        """設定値を整数に変換し、範囲内に収めて返す。"""
-        candidate = default
+    def apply_fonts(self):
+        """QSettings のフォント設定を左ペインとリストビューに適用する"""
         try:
-            if value is None:
-                candidate = default
-            elif isinstance(value, bool):
-                candidate = int(value)
-            elif isinstance(value, int):
-                candidate = value
-            elif isinstance(value, float):
-                candidate = int(value)
-            elif isinstance(value, str):
-                stripped = value.strip()
-                if stripped:
-                    candidate = int(stripped)
-        except (ValueError, TypeError):
-            candidate = default
-        if minimum is not None:
-            candidate = max(candidate, minimum)
-        if maximum is not None:
-            candidate = min(candidate, maximum)
-        return candidate
-
-    @staticmethod
-    def _coerce_str(value, default):
-        """設定値を文字列に変換"""
-        if value is None:
-            return default
-        if isinstance(value, str):
-            return value
-        return str(value)
-
-    @classmethod
-    def _coerce_color(cls, value, default):
-        """色設定を#RRGGBB形式に変換"""
-        candidate = cls._coerce_str(value, default).strip()
-        if (
-            len(candidate) == 7
-            and candidate.startswith("#")
-            and all(c in string.hexdigits for c in candidate[1:])
-        ):
-            return candidate.upper()
-        return default
+            s = self.settings
+            tree_family = coerce_str(s.value("tree_font_family", ""), "")
+            tree_size = coerce_int(s.value("tree_font_size", 10), 10, minimum=8, maximum=24)
+            list_family = coerce_str(s.value("list_font_family", ""), "")
+            list_size = coerce_int(s.value("list_font_size", 10), 10, minimum=8, maximum=24)
+            if tree_family and hasattr(self, 'left_pane') and hasattr(self.left_pane, 'tree_view'):
+                self.left_pane.tree_view.setFont(QFont(tree_family, tree_size))
+            if list_family and hasattr(self, 'list_view'):
+                self.list_view.setFont(QFont(list_family, list_size))
+        except Exception as e:
+            logger.error(f"Apply fonts error: {e}")
 
     def _on_metadata_ready(self, path: str, info: dict) -> None:
         """動画メタデータ取得完了時の処理"""
-        # メインスレッドでUI更新を行うため、安全策をとる
-        # dataChangedは自動的にUI更新をトリガーする
         if hasattr(self, 'file_system_model'):
             self.file_system_model.update_metadata(path, info)
 
+    def _get_video_digest_generator(self):
+        """動画ダイジェスト生成器を必要時に生成して返す。"""
+        if not VIDEO_DIGEST_AVAILABLE:
+            return None
+        if self.video_digest_generator is None:
+            self.video_digest_generator = VideoDigestGenerator()
+        return self.video_digest_generator
+
+    def _is_video_file(self, path: str) -> bool:
+        """動画ファイル判定を共通化する。"""
+        generator = self._get_video_digest_generator()
+        if generator:
+            return bool(generator.is_video_file(path))
+        video_extensions = {
+            ".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv",
+            ".webm", ".m4v", ".3gp", ".mpg", ".mpeg",
+        }
+        return bool(path and os.path.isfile(path) and Path(path).suffix.lower() in video_extensions)
+
+    def _ensure_metadata_worker(self) -> bool:
+        """動画メタデータ取得ワーカーを必要時に初期化する。"""
+        if not VIDEO_DIGEST_AVAILABLE:
+            return False
+        if self.thread_pool is None:
+            from PySide6.QtCore import QThreadPool
+            self.thread_pool = QThreadPool()
+            self.thread_pool.setMaxThreadCount(2)  # 動画メタデータ取得は 2 スレッドまで
+        if self.metadata_worker is None:
+            worker = VideoMetadataWorker()
+            worker.metadata_ready.connect(self._on_metadata_ready)
+            self.metadata_worker = worker
+        return True
+
     def _request_metadata_fetch(self, path: str) -> None:
         """動画メタデータの取得をリクエスト"""
-        # ワーカーで非同期実行
-        from PySide6.QtCore import QRunnable
+        if not self._ensure_metadata_worker():
+            return
 
+        from PySide6.QtCore import QRunnable
         class FetchTask(QRunnable):
             def __init__(self, worker, path):
                 super().__init__()
                 self.worker = worker
                 self.path = path
-            
             def run(self):
                 self.worker.fetch_metadata(self.path)
         
-        # 既に取得中かどうかはモデル側で制御されているが、念のため
-        if self.metadata_worker:
+        if self.metadata_worker and self.thread_pool:
             task = FetchTask(self.metadata_worker, path)
             self.thread_pool.start(task)
 
@@ -995,7 +387,7 @@ class FileManagerWidget(QWidget):
         """ワーカースレッドのクリーンアップ"""
         if self.worker_thread and self.worker_thread.isRunning():
             self.worker_thread.quit()
-            if not self.worker_thread.wait(3000):  # 3秒でタイムアウト
+            if not self.worker_thread.wait(3000):
                 self.worker_thread.terminate()
                 self.worker_thread.wait(3000)
         
@@ -1007,1856 +399,1921 @@ class FileManagerWidget(QWidget):
             self.worker_thread.deleteLater()
             self.worker_thread = None
 
+        if self.thread_pool is not None:
+            self.thread_pool.waitForDone(3000)
+            self.thread_pool = None
+
+        self.metadata_worker = None
+
         if getattr(self, 'thumbnail_preview', None):
             self.thumbnail_preview.shutdown()
+
+        if getattr(self, '_video_player_window', None):
+            self._video_player_window.close()
+            self._video_player_window = None
     
     def closeEvent(self, event):
         """ウィジェットが閉じられる時のクリーンアップ"""
         self.cleanup_worker()
-        # 左ペインのクリーンアップも実行
         if hasattr(self, 'left_pane'):
             self.left_pane.cleanup_worker()
-        # 設定を保存し、最後のパスを記録
         try:
-            self.settings.setValue("last_path", self.current_path)
-            self.save_settings()
-        except Exception:
-            pass
+            self.save_window_state()
+        except Exception as e:
+            logger.error(f"Failed to save window state: {e}")
         super().closeEvent(event)
     
     def init_ui(self):
         """UIの初期化"""
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        
-        # ツールバーの作成
+
         self.create_toolbar()
-        layout.addWidget(self.toolbar)
-        
-        # 左ペイン: フォルダツリー（ドライブバーは上部へ配置）
+
         self.left_pane = LeftPaneWidget()
+        self.left_pane.setObjectName("leftPane")
+        self.left_pane.setMinimumWidth(200)
         self.left_pane.drive_selected.connect(self.on_drive_selected)
 
-        drive_widget = self.left_pane.take_drive_widget()
-        if drive_widget is not None:
-            layout.addWidget(drive_widget)
+        # ナビゲーションバー
+        nav_bar = QWidget()
+        nav_bar.setObjectName("navBar")
+        nav_bar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        nav_layout = QHBoxLayout(nav_bar)
+        nav_layout.setContentsMargins(12, 4, 12, 4)
+        nav_layout.setSpacing(6)
 
-        # スプリッターの作成
+        try:
+            from .ui_icons import apply_icon_to_button as _nav_icon
+        except ImportError:
+            def _nav_icon(btn, name, fallback, **kw):
+                btn.setText(fallback)
+
+        self.back_button = QPushButton("‹")
+        self.back_button.setObjectName("navBtn")
+        self.back_button.setToolTip("戻る (Alt+←)")
+        self.back_button.setEnabled(False)
+        self.back_button.setFixedSize(28, 28)
+        _nav_icon(self.back_button, "nav_back", "‹")
+        self.back_button.clicked.connect(self.navigate_back)
+
+        self.forward_button = QPushButton("›")
+        self.forward_button.setObjectName("navBtn")
+        self.forward_button.setToolTip("進む (Alt+→)")
+        self.forward_button.setEnabled(False)
+        self.forward_button.setFixedSize(28, 28)
+        _nav_icon(self.forward_button, "nav_forward", "›")
+        self.forward_button.clicked.connect(self.navigate_forward)
+
+        self.address_bar = QLineEdit()
+        self.address_bar.setObjectName("addressBar")
+        self.address_bar.setPlaceholderText("パスを入力して Enter...")
+        self.address_bar.returnPressed.connect(self.navigate_to_address)
+        self.address_bar.installEventFilter(self)
+
+        self.address_stack = QStackedWidget()
+        self.address_stack.setObjectName("addressStack")
+        self.address_stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        self.breadcrumb_bar = QWidget()
+        self.breadcrumb_bar.setObjectName("breadcrumbBar")
+        self.breadcrumb_bar.setCursor(Qt.CursorShape.IBeamCursor)
+        self.breadcrumb_bar.installEventFilter(self)
+        self.breadcrumb_layout = QHBoxLayout(self.breadcrumb_bar)
+        self.breadcrumb_layout.setContentsMargins(6, 2, 6, 2)
+        self.breadcrumb_layout.setSpacing(2)
+
+        self.address_stack.addWidget(self.breadcrumb_bar)
+        self.address_stack.addWidget(self.address_bar)
+
+        nav_layout.addWidget(self.back_button)
+        nav_layout.addWidget(self.forward_button)
+        nav_layout.addWidget(self.address_stack, 1)
+        layout.addWidget(nav_bar)
+
         self.splitter = QSplitter(Qt.Horizontal)
         layout.addWidget(self.splitter)
         
-        # 右ペイン: ファイル一覧（詳細表示対応）
-        self.list_view = QTreeView()
+        self.list_view = FileListView(self)
+        self.list_view.setObjectName("fileList")
         self.list_view.setRootIsDecorated(False)
         self.list_view.setAlternatingRowColors(True)
         self.list_view.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.list_view.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.list_view.setSortingEnabled(True)
         self.list_view.setHeaderHidden(False)
+        self.list_view.setDragEnabled(True)
+        self.list_view.setDragDropMode(QAbstractItemView.DragOnly)
+        self.list_view.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.list_view.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         
-        # ヘッダーの右クリックメニューを設定
         header = self.list_view.header()
         header.setContextMenuPolicy(Qt.CustomContextMenu)
         header.customContextMenuRequested.connect(self.show_column_menu)
         
-        # 右ペイン用プログレスバー
         self.right_progress_bar = QProgressBar()
         self.right_progress_bar.setVisible(False)
-        self.right_progress_bar.setRange(0, 0)  # 不定プログレスバー
-        self.right_progress_bar.setFixedHeight(20)
+        self.right_progress_bar.setRange(0, 0)
+        self.right_progress_bar.setFixedHeight(3)
+        self.right_progress_bar.setTextVisible(False)
         
-        # 右ペイン用のコンテナウィジェット
         self.right_pane_widget = QWidget()
+        self.right_pane_widget.setObjectName("rightPane")
         self.right_pane_layout = QVBoxLayout(self.right_pane_widget)
         self.right_pane_layout.setContentsMargins(0, 0, 0, 0)
         self.right_pane_layout.setSpacing(0)
         
-        # プログレスバーを右ペインに追加
         self.right_pane_layout.addWidget(self.right_progress_bar)
-        
-        # リストビューを右ペインに追加
         self.right_pane_layout.addWidget(self.list_view, 1)
 
-        # マウス追跡を有効化（ホバーイベント用）
         self.list_view.setMouseTracking(True)
         self.list_view.entered.connect(self.on_list_view_entered)
 
+        self.bento_grid = QWidget()
+        self.bento_grid.setObjectName("bentoGrid")
+        bento_layout = QGridLayout(self.bento_grid)
+        bento_layout.setContentsMargins(8, 8, 8, 8)
+        bento_layout.setHorizontalSpacing(8)
+        bento_layout.setVerticalSpacing(8)
 
         self.thumbnail_preview = VideoThumbnailPreview(
             self.right_pane_widget,
             max_thumbnails=self.video_thumbnail_count,
             thumbnail_size=self.video_thumbnail_size,
+            cache_size_mb=self.video_digest_cache_size_mb,
         )
         self.thumbnail_preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.right_pane_layout.addWidget(self.thumbnail_preview, 0)
+        bento_layout.addWidget(self.thumbnail_preview, 0, 0, 2, 2)
+
+        self.recent_history_card = self._create_bento_info_card("最近の履歴", "履歴なし")
+        self.recent_history_value = self.recent_history_card.findChild(QLabel, "bentoValue")
+        bento_layout.addWidget(self.recent_history_card, 0, 2)
+
+        self.storage_card = self._create_bento_info_card("ストレージ容量", "取得中")
+        self.storage_value = self.storage_card.findChild(QLabel, "bentoValue")
+        bento_layout.addWidget(self.storage_card, 1, 2)
+
+        bento_layout.setColumnStretch(0, 2)
+        bento_layout.setColumnStretch(1, 2)
+        bento_layout.setColumnStretch(2, 1)
+
+        self.right_pane_layout.addWidget(self.bento_grid, 0)
         self.right_pane_layout.setStretch(0, 0)
         self.right_pane_layout.setStretch(1, 1)
         self.right_pane_layout.setStretch(2, 0)
 
-        # スプリッターにウィジェットを追加
         self.splitter.addWidget(self.left_pane)
         self.splitter.addWidget(self.right_pane_widget)
 
-        # スプリッターの比率設定とリサイズ可能にする
         self.splitter.setSizes([300, 900])
         self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
-        self.splitter.setChildrenCollapsible(False)  # ペインの完全な折りたたみを無効化
+        self.splitter.setChildrenCollapsible(False)
 
-        # スプリッターハンドルの設定
         handle = self.splitter.handle(1)
         handle.setEnabled(True)
+        self._collapse_filter = _SplitterCollapseFilter(self.splitter)
+        handle.installEventFilter(self._collapse_filter)
+        self.splitter.splitterMoved.connect(lambda *_: self._save_splitter_state())
+
+    def _create_bento_info_card(self, title: str, value: str) -> QFrame:
+        card = QFrame()
+        card.setObjectName("bentoCard")
+        card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(12, 10, 12, 10)
+        card_layout.setSpacing(4)
+
+        title_label = QLabel(title)
+        title_label.setObjectName("bentoTitle")
+        value_label = QLabel(value)
+        value_label.setObjectName("bentoValue")
+        value_label.setWordWrap(True)
+
+        card_layout.addWidget(title_label)
+        card_layout.addWidget(value_label)
+        card_layout.addStretch()
+        return card
+
+    @staticmethod
+    def _format_capacity(value: int) -> str:
+        units = ("B", "KB", "MB", "GB", "TB")
+        amount = float(value)
+        unit = units[0]
+        for unit in units:
+            if amount < 1024 or unit == units[-1]:
+                break
+            amount /= 1024
+        return f"{amount:.1f} {unit}" if unit != "B" else f"{int(amount)} B"
+
+    def _update_bento_cards(self) -> None:
+        if hasattr(self, "recent_history_value") and self.recent_history_value is not None:
+            recent = [
+                os.path.basename(path.rstrip("\\/")) or path
+                for path in reversed(getattr(self, "_nav_history", [])[-3:])
+                if path
+            ]
+            self.recent_history_value.setText(" / ".join(recent) if recent else "履歴なし")
+
+        if hasattr(self, "storage_value") and self.storage_value is not None:
+            try:
+                usage = shutil.disk_usage(self.current_path)
+                free = self._format_capacity(usage.free)
+                total = self._format_capacity(usage.total)
+                percent = int((usage.used / usage.total) * 100) if usage.total else 0
+                self.storage_value.setText(f"{free} 空き / {total}  ({percent}% 使用)")
+            except Exception as e:
+                logger.debug(f"Failed to get disk usage: {e}")
+                self.storage_value.setText("容量を取得できません")
     
     def show_right_progress(self, message="読み込み中..."):
-        """右ペインのプログレスバーを表示"""
         self.right_progress_bar.setVisible(True)
         self.right_progress_bar.setFormat(message)
         self.list_view.setEnabled(False)
     
     def hide_right_progress(self):
-        """右ペインのプログレスバーを非表示"""
         self.right_progress_bar.setVisible(False)
         self.list_view.setEnabled(True)
     
     def create_toolbar(self):
-        """ツールバーの作成"""
-        self.toolbar = QToolBar()
-        self.toolbar.setMovable(False)
-        
-        # 上へボタン
-        self.up_button = QPushButton("↑")
+        self.toolbar = QToolBar("ツールバー")
+        self.toolbar.setObjectName("mainToolBar")
+        self.toolbar.setMovable(True)
+        self.toolbar.setFloatable(True)
+        self.toolbar.setWindowTitle("ツールバー")
+        self._create_toolbar_widgets()
+        self._rebuild_toolbar_items()
+
+    def _create_toolbar_widgets(self):
+        try:
+            from .ui_icons import apply_icon_to_button as _apply_icon
+        except ImportError:
+            def _apply_icon(btn, name, fallback, **kw):
+                btn.setText(fallback)
+
+        self.up_button = QPushButton()
         self.up_button.setToolTip("上へ")
+        _apply_icon(self.up_button, "up", "↑")
         self.up_button.clicked.connect(self.navigate_up)
-        self.toolbar.addWidget(self.up_button)
-        
-        # 更新ボタン
-        self.refresh_button = QPushButton("↻")
+
+        self.refresh_button = QPushButton()
         self.refresh_button.setToolTip("更新")
+        _apply_icon(self.refresh_button, "refresh", "↻")
         self.refresh_button.clicked.connect(self.refresh)
-        self.toolbar.addWidget(self.refresh_button)
-        
-        self.toolbar.addSeparator()
-        
-        # 表示モード切替
+
+        self.copy_button = QPushButton()
+        self.copy_button.setToolTip("コピー")
+        _apply_icon(self.copy_button, "copy", "📋")
+        self.copy_button.clicked.connect(self.copy_selected_files)
+        self.copy_button.setEnabled(False)
+
+        self.cut_button = QPushButton()
+        self.cut_button.setToolTip("切り取り")
+        _apply_icon(self.cut_button, "cut", "✂")
+        self.cut_button.clicked.connect(self.cut_selected_files)
+        self.cut_button.setEnabled(False)
+
+        self.paste_button = QPushButton()
+        self.paste_button.setToolTip("貼り付け")
+        _apply_icon(self.paste_button, "paste", "📌")
+        self.paste_button.clicked.connect(self.paste_files)
+        self.paste_button.setEnabled(False)
+
+        self.delete_button = QPushButton()
+        self.delete_button.setToolTip("ゴミ箱へ移動")
+        _apply_icon(self.delete_button, "delete", "🗑")
+        self.delete_button.clicked.connect(self.move_selected_files_to_trash)
+        self.delete_button.setEnabled(False)
+
+        self.rename_button = QPushButton()
+        self.rename_button.setToolTip("名前変更")
+        _apply_icon(self.rename_button, "rename", "✏")
+        self.rename_button.clicked.connect(self.rename_selected_file)
+
+        self.new_folder_button = QPushButton()
+        self.new_folder_button.setToolTip("新規フォルダ")
+        _apply_icon(self.new_folder_button, "new_folder", "📁")
+        self.new_folder_button.clicked.connect(self.create_new_folder)
+
         self.view_mode_combo = QComboBox()
         self.view_mode_combo.addItems(["リスト表示", "アイコン表示", "詳細表示"])
         self.view_mode_combo.currentTextChanged.connect(self.change_view_mode)
-        self.toolbar.addWidget(self.view_mode_combo)
-        
-        self.toolbar.addSeparator()
-        
-        # ソート選択
+
         self.sort_combo = QComboBox()
         self.sort_combo.addItems(["名前", "サイズ", "更新日", "種類"])
         self.sort_combo.currentTextChanged.connect(self.change_sort_order)
-        self.toolbar.addWidget(self.sort_combo)
-        
-        self.toolbar.addSeparator()
-        
-        # 検索ボックス
+
         self.search_box = QLineEdit()
         self.search_box.setPlaceholderText("ファイル名で検索...")
-        self.search_box.textChanged.connect(self.filter_files)
-        self.toolbar.addWidget(self.search_box)
-        
-        # ファイル検索ボタン
-        self.search_button = QPushButton("🔍")
+        self.search_box.setMinimumWidth(160)
+
+        self._search_debounce_timer = QTimer(self)
+        self._search_debounce_timer.setSingleShot(True)
+        self._search_debounce_timer.setInterval(150)
+        self._search_debounce_timer.timeout.connect(
+            lambda: self.filter_files(self.search_box.text())
+        )
+        self.search_box.textChanged.connect(
+            lambda _: self._search_debounce_timer.start()
+        )
+
+        self.foreign_filename_checkbox = QCheckBox("外国語名")
+        self.foreign_filename_checkbox.setToolTip("外国語と思われるファイル名のみ表示")
+        self.foreign_filename_checkbox.toggled.connect(self.toggle_foreign_filename_filter)
+
+        self.search_button = QPushButton()
         self.search_button.setToolTip("ファイル検索")
+        _apply_icon(self.search_button, "search", "🔍")
         self.search_button.clicked.connect(self.show_file_search_dialog)
-        self.search_button.setEnabled(True)
-        self.toolbar.addWidget(self.search_button)
-        
-        self.toolbar.addSeparator()
-        
-        # 隠しファイル表示切替ボタン
-        self.hidden_button = QPushButton("👁")
+
+        self.hidden_button = QPushButton()
         self.hidden_button.setToolTip("隠しファイル表示切替")
         self.hidden_button.setCheckable(True)
+        _apply_icon(self.hidden_button, "hidden", "👁")
         self.hidden_button.clicked.connect(self.toggle_hidden_files)
-        self.toolbar.addWidget(self.hidden_button)
-        
-        self.toolbar.addSeparator()
-        
-        # 設定ボタン
-        self.settings_button = QPushButton("⚙")
-        self.settings_button.setToolTip("設定")
-        self.settings_button.clicked.connect(self.show_settings)
-        self.toolbar.addWidget(self.settings_button)
-        
-        self.toolbar.addSeparator()
-        
-        # ディスク分析ボタン
-        self.disk_analysis_button = QPushButton("📊")
-        self.disk_analysis_button.setToolTip("ディスク使用量分析")
-        self.disk_analysis_button.clicked.connect(self.show_disk_analysis_dialog)
-        # 同様にボタンは有効にしておき、呼び出し時にモジュールをロードする
-        self.disk_analysis_button.setEnabled(True)
-        self.toolbar.addWidget(self.disk_analysis_button)
 
-        # 重複動画検出ボタン
-        self.duplicate_videos_button = QPushButton("重複動画")
-        self.duplicate_videos_button.setToolTip("選択中フォルダ内の重複動画を検出")
+        self.disk_analysis_button = QPushButton()
+        self.disk_analysis_button.setToolTip("ディスク使用量分析")
+        _apply_icon(self.disk_analysis_button, "disk_analysis", "📊")
+        self.disk_analysis_button.clicked.connect(self.show_disk_analysis_dialog)
+
+        self.duplicate_videos_button = QPushButton()
+        self.duplicate_videos_button.setToolTip("重複動画を検出")
+        _apply_icon(self.duplicate_videos_button, "dup_videos", "🎬")
         self.duplicate_videos_button.clicked.connect(self.show_duplicate_videos_dialog)
         self.duplicate_videos_button.setEnabled(VIDEO_DUPLICATES_AVAILABLE)
-        self.toolbar.addWidget(self.duplicate_videos_button)
 
-        # ファイル名類似度検出ボタン
-        self.filename_similarity_button = QPushButton("類似ファイル名")
-        self.filename_similarity_button.setToolTip("選択中フォルダ内のファイル名が類似したファイルを検出")
+        self.filename_similarity_button = QPushButton()
+        self.filename_similarity_button.setToolTip("類似ファイル名を検出")
+        _apply_icon(self.filename_similarity_button, "similar_files", "📄")
         self.filename_similarity_button.clicked.connect(self.show_filename_similarity_dialog)
         self.filename_similarity_button.setEnabled(FILENAME_SIMILARITY_AVAILABLE)
-        self.toolbar.addWidget(self.filename_similarity_button)
 
-        # 同じファイルサイズ検出ボタン
-        self.same_filesize_button = QPushButton("同サイズ")
-        self.same_filesize_button.setToolTip("選択中フォルダ内の同じファイルサイズのファイルを検出")
+        self.same_filesize_button = QPushButton()
+        self.same_filesize_button.setToolTip("同じファイルサイズのファイルを検出")
+        _apply_icon(self.same_filesize_button, "same_size", "⚖")
         self.same_filesize_button.clicked.connect(self.show_same_filesize_dialog)
         self.same_filesize_button.setEnabled(SAME_FILESIZE_AVAILABLE)
-        self.toolbar.addWidget(self.same_filesize_button)
 
-        # 選択したファイルをゴミ箱に移動ボタン
-        self.move_to_trash_button = QPushButton("🗑️")
+        self.move_to_trash_button = QPushButton()
         self.move_to_trash_button.setToolTip("選択したファイルをゴミ箱に移動")
+        _apply_icon(self.move_to_trash_button, "trash", "🗑️")
         self.move_to_trash_button.clicked.connect(self.move_selected_files_to_trash)
         self.move_to_trash_button.setEnabled(False)
-        self.toolbar.addWidget(self.move_to_trash_button)
+
+        self.video_player_button = QPushButton()
+        self.video_player_button.setToolTip("選択した動画を別ウィンドウで再生")
+        _apply_icon(self.video_player_button, "video_player", "▶")
+        self.video_player_button.clicked.connect(self.open_selected_video_player)
+        self.video_player_button.setEnabled(VIDEO_PLAYER_AVAILABLE)
+
+        self.settings_button = QPushButton()
+        self.settings_button.setToolTip("設定")
+        _apply_icon(self.settings_button, "settings", "⚙")
+        self.settings_button.clicked.connect(self.show_settings)
+
+    def _get_toolbar_widget(self, item_id: str):
+        return {
+            "up":           self.up_button,
+            "refresh":      self.refresh_button,
+            "copy":         self.copy_button,
+            "cut":          self.cut_button,
+            "paste":        self.paste_button,
+            "delete":       self.delete_button,
+            "rename":       self.rename_button,
+            "new_folder":   self.new_folder_button,
+            "view_mode":    self.view_mode_combo,
+            "sort":         self.sort_combo,
+            "search_box":   self.search_box,
+            "foreign_filter": self.foreign_filename_checkbox,
+            "search":       self.search_button,
+            "hidden":       self.hidden_button,
+            "disk_analysis":self.disk_analysis_button,
+            "dup_videos":   self.duplicate_videos_button,
+            "similar_files":self.filename_similarity_button,
+            "same_size":    self.same_filesize_button,
+            "trash":        self.move_to_trash_button,
+            "video_player":  self.video_player_button,
+            "settings":     self.settings_button,
+        }.get(item_id)
+
+    _ICON_REFRESH_MAP = [
+        ("up_button",               "up",           "↑"),
+        ("refresh_button",          "refresh",      "↻"),
+        ("copy_button",             "copy",         "📋"),
+        ("cut_button",              "cut",          "✂"),
+        ("paste_button",            "paste",        "📌"),
+        ("delete_button",           "delete",       "🗑"),
+        ("rename_button",           "rename",       "✏"),
+        ("new_folder_button",       "new_folder",   "📁"),
+        ("search_button",           "search",       "🔍"),
+        ("hidden_button",           "hidden",       "👁"),
+        ("disk_analysis_button",    "disk_analysis","📊"),
+        ("duplicate_videos_button", "dup_videos",   "🎬"),
+        ("filename_similarity_button","similar_files","📄"),
+        ("same_filesize_button",    "same_size",    "⚖"),
+        ("move_to_trash_button",    "trash",        "🗑️"),
+        ("video_player_button",     "video_player", "▶"),
+        ("settings_button",         "settings",     "⚙"),
+        ("back_button",             "nav_back",     "‹"),
+        ("forward_button",          "nav_forward",  "›"),
+    ]
+
+    def refresh_icons(self) -> None:
+        try:
+            from .ui_icons import apply_icon_to_button
+        except ImportError:
+            return
+        for attr, icon_name, fallback in self._ICON_REFRESH_MAP:
+            btn = getattr(self, attr, None)
+            if btn is not None:
+                apply_icon_to_button(btn, icon_name, fallback)
+
+    def _rebuild_toolbar_items(self):
+        for action in list(self.toolbar.actions()):
+            widget = self.toolbar.widgetForAction(action)
+            if widget is not None:
+                widget.hide()
+            self.toolbar.removeAction(action)
+            action.deleteLater()
+        try:
+            self.settings.sync()
+            order_str = normalize_toolbar_order(
+                self.settings.value("toolbar_order", TOOLBAR_DEFAULT_ORDER)
+            )
+        except Exception:
+            order_str = TOOLBAR_DEFAULT_ORDER
+        has_widget = False
+        for item_id in [x.strip() for x in order_str.split(",") if x.strip()]:
+            if item_id == "SEP":
+                self.toolbar.addSeparator()
+            else:
+                widget = self._get_toolbar_widget(item_id)
+                if widget is not None:
+                    self.toolbar.addWidget(widget)
+                    # QToolBar.clear() で外したウィジェットは hidden フラグが残るため、
+                    # 再追加後に明示的に表示し直さないとツールバーから消えてしまう。
+                    widget.setVisible(True)
+                    has_widget = True
+        if not has_widget and order_str != TOOLBAR_DEFAULT_ORDER:
+            self.settings.setValue("toolbar_order", TOOLBAR_DEFAULT_ORDER)
+            self.settings.sync()
+            self._rebuild_toolbar_items()
+            return
+        if has_widget:
+            self.toolbar.show()
+
+    def rebuild_toolbar(self):
+        self._rebuild_toolbar_items()
     
     def setup_models(self):
-        """モデルの設定"""
-        # 右ペイン用のカスタムファイルシステムモデル（ファイルとフォルダー両方表示）
         self.file_system_model = CustomFileSystemModel()
         self.file_system_model.setRootPath("")
         
-        # プロキシモデルの設定（サイズ列を数値でソート可能にする）
         self.proxy_model = FileSortFilterProxyModel()
         self.proxy_model.setFilterCaseSensitivity(Qt.CaseInsensitive)
         self.proxy_model.setDynamicSortFilter(True)
         self.proxy_model.setSourceModel(self.file_system_model)
         
-        # リストビューにモデルを設定
         self.list_view.setModel(self.proxy_model)
-        
-        # 初期パスの設定
         self.update_filter_only()
         self.set_current_path(self.current_path)
     
     def connect_signals(self):
-        """シグナルの接続"""
-        # 左ペインのフォルダツリーの選択変更
         self.left_pane.tree_view.selectionModel().currentChanged.connect(self.on_tree_selection_changed)
+        self.left_pane.tree_view.clicked.connect(self._on_tree_clicked)
         
         if hasattr(self.file_system_model, 'modelReset'):
             self.file_system_model.modelReset.connect(self._restore_current_root_index)
-            if hasattr(self.proxy_model, 'modelReset'):
-                self.proxy_model.modelReset.connect(self._restore_current_root_index)
 
-        # リストビューのダブルクリック
         self.list_view.doubleClicked.connect(self.on_list_double_clicked)
-        
-        # リストビューの選択変更
         self.list_view.selectionModel().selectionChanged.connect(self.on_list_selection_changed)
-        
-        # チェックボックス選択変更時のシグナル接続
-        self.proxy_model.dataChanged.connect(self.on_checkbox_selection_changed)
+        self.list_view.middle_clicked.connect(self._on_list_middle_clicked)
 
-        # 動画メタデータ取得リクエスト
+        if hasattr(self.left_pane.tree_view, 'files_dropped'):
+            self.left_pane.tree_view.files_dropped.connect(self.on_files_dropped_to_folder)
+
         if hasattr(self.file_system_model, 'metadata_fetch_requested'):
             self.file_system_model.metadata_fetch_requested.connect(self._request_metadata_fetch)
-    
+
+        # タグフィルタパネルとの接続
+        if hasattr(self.left_pane, 'tag_filter') and self.left_pane.tag_filter is not None:
+            self.left_pane.tag_filter.filter_changed.connect(self._on_tag_filter_changed)
+
     def setup_context_menus(self):
-        """コンテキストメニューの設定"""
-        # 左ペインのツリービューのコンテキストメニュー
         self.left_pane.tree_view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.left_pane.tree_view.customContextMenuRequested.connect(self.show_tree_context_menu)
-        
-        # リストビューのコンテキストメニュー
         self.list_view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.list_view.customContextMenuRequested.connect(self.show_list_context_menu)
+
+    def _setup_shortcuts(self):
+        if not hasattr(self, "right_pane_widget") or not hasattr(self, "list_view"):
+            return
+        QShortcut(QKeySequence("Alt+Left"), self, activated=self.navigate_back)
+        QShortcut(QKeySequence("Alt+Right"), self, activated=self.navigate_forward)
+        QShortcut(QKeySequence("Alt+Up"), self, activated=self.navigate_up)
+        QShortcut(QKeySequence("F5"), self, activated=self.refresh)
+        QShortcut(QKeySequence("Ctrl+L"), self, activated=self.focus_address_bar)
+        QShortcut(QKeySequence("Ctrl+H"), self, activated=self.toggle_hidden_files)
+        QShortcut(QKeySequence("Ctrl+Shift+N"), self, activated=self.create_new_folder)
+
+        right_scope = self.right_pane_widget
+        sc_trash = QShortcut(QKeySequence("Delete"), right_scope, activated=self.move_selected_files_to_trash)
+        sc_trash.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        sc_delete = QShortcut(QKeySequence("Shift+Delete"), right_scope, activated=self.delete_selected_files)
+        sc_delete.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        sc_rename = QShortcut(QKeySequence("F2"), right_scope, activated=self.rename_selected_file)
+        sc_rename.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        sc_select_all = QShortcut(QKeySequence(QKeySequence.StandardKey.SelectAll), right_scope, activated=self.select_all_files)
+        sc_select_all.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        sc_video = QShortcut(QKeySequence(Qt.Key.Key_Space), right_scope, activated=self.open_selected_video_player)
+        sc_video.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+
+        QShortcut(QKeySequence(Qt.Key.Key_Backspace), self.list_view, activated=self.navigate_up).setContext(Qt.ShortcutContext.WidgetShortcut)
+        QShortcut(QKeySequence(Qt.Key.Key_Backspace), self.left_pane.tree_view, activated=self.navigate_up).setContext(Qt.ShortcutContext.WidgetShortcut)
+
+        self._apply_shortcut_tooltips()
+
+    def _apply_shortcut_tooltips(self):
+        tip_map = {
+            'up_button':            "上へ (Alt+↑)",
+            'refresh_button':       "更新 (F5)",
+            'rename_button':        "名前変更 (F2)",
+            'delete_button':        "ゴミ箱へ移動 (Del)",
+            'move_to_trash_button': "ゴミ箱へ移動 (Del)",
+            'new_folder_button':    "新規フォルダ (Ctrl+Shift+N)",
+            'hidden_button':        "隠しファイル表示切替 (Ctrl+H)",
+            'video_player_button':   "選択した動画を別ウィンドウで再生 (Space)",
+        }
+        for attr, tip in tip_map.items():
+            btn = getattr(self, attr, None)
+            if btn is not None:
+                btn.setToolTip(tip)
+
+    def focus_address_bar(self):
+        self._show_address_editor()
+        self.address_bar.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self.address_bar.selectAll()
+
+    def eventFilter(self, watched, event):
+        if watched is getattr(self, "address_bar", None):
+            if event.type() == QEvent.Type.FocusOut:
+                QTimer.singleShot(0, self._show_breadcrumb_bar)
+        elif watched is getattr(self, "breadcrumb_bar", None):
+            if event.type() == QEvent.Type.MouseButtonPress:
+                self.focus_address_bar()
+                return True
+        return super().eventFilter(watched, event)
+
+    def _show_address_editor(self) -> None:
+        if hasattr(self, "address_stack"):
+            self.address_stack.setCurrentWidget(self.address_bar)
+
+    def _show_breadcrumb_bar(self, force: bool = False) -> None:
+        if not hasattr(self, "address_stack"):
+            return
+        if self.address_bar.hasFocus() and not force:
+            return
+        self.address_bar.setText(self.current_path)
+        self.address_stack.setCurrentWidget(self.breadcrumb_bar)
+
+    def _clear_breadcrumb(self) -> None:
+        while self.breadcrumb_layout.count():
+            item = self.breadcrumb_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    @staticmethod
+    def _breadcrumb_segments(path: str) -> list[tuple[str, str]]:
+        normalized = os.path.normpath(path)
+        drive, tail = os.path.splitdrive(normalized)
+        segments: list[tuple[str, str]] = []
+
+        if drive:
+            root = drive + os.sep
+            segments.append((root, root))
+            current = root
+            parts = [part for part in tail.strip("\\/").split(os.sep) if part]
+        elif normalized.startswith(os.sep):
+            segments.append((os.sep, os.sep))
+            current = os.sep
+            parts = [part for part in normalized.strip(os.sep).split(os.sep) if part]
+        else:
+            current = ""
+            parts = [part for part in normalized.split(os.sep) if part]
+
+        for part in parts:
+            current = os.path.join(current, part) if current else part
+            segments.append((part, current))
+        return segments
+
+    def _update_breadcrumb_bar(self, path: str) -> None:
+        if not hasattr(self, "breadcrumb_layout"):
+            return
+        self._clear_breadcrumb()
+
+        segments = self._breadcrumb_segments(path)
+        if not segments:
+            label = QLabel(path)
+            label.setObjectName("breadcrumbCurrent")
+            self.breadcrumb_layout.addWidget(label)
+        else:
+            for index, (label_text, target_path) in enumerate(segments):
+                if index > 0:
+                    separator = QLabel("›")
+                    separator.setObjectName("breadcrumbSeparator")
+                    separator.setCursor(Qt.CursorShape.IBeamCursor)
+                    self.breadcrumb_layout.addWidget(separator)
+
+                button = QPushButton(label_text)
+                button.setObjectName("breadcrumbSegment")
+                button.setToolTip(target_path)
+                button.setCursor(Qt.CursorShape.PointingHandCursor)
+                button.clicked.connect(partial(self.set_current_path, target_path))
+                self.breadcrumb_layout.addWidget(button)
+
+        self.breadcrumb_layout.addStretch(1)
     
     def on_drive_selected(self, drive):
-        """ドライブが選択された時の処理"""
-        if sys.platform == "win32":
-            drive_path = f"{drive}:\\"
-        else:
-            drive_path = drive
-        
-        # 保存: 左ペインの選択ドライブを設定
+        drive_path = f"{drive}:\\" if sys.platform == "win32" else drive
         try:
             self.settings.setValue("last_drive", drive)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Failed to save last_drive: {e}")
         self.set_current_path(drive_path)
 
     def set_current_path(self, path):
-        """現在のパスを設定"""
+        old = getattr(self, 'current_path', None)
+        if not getattr(self, '_nav_jumping', False) and old and old != path:
+            self._nav_history.append(old)
+            self._nav_forward_stack.clear()
         self.current_path = path
-        # 現在のパスを永続化
+        self.address_bar.setText(path)
+        self._update_breadcrumb_bar(path)
+        self._show_breadcrumb_bar()
+        self._sync_left_pane_to_path(path)
+        self._update_nav_buttons()
+        self._update_bento_cards()
         try:
             self.settings.setValue("last_path", path)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Failed to save current path: {e}")
         self.set_current_path_async(path)
+        self._refresh_tag_filter(path)
+
+    def _refresh_tag_filter(self, path: str) -> None:
+        """パス変更時にタグフィルタパネルを更新する。"""
+        if not VIDEO_CLUSTER_AVAILABLE:
+            return
+        tf = getattr(self.left_pane, 'tag_filter', None)
+        if tf is None:
+            return
+        db = self._get_cluster_db()
+        if db is None:
+            return
+        tf.set_db(db)
+        tf.refresh(path)
+
+    def _get_cluster_db(self) -> "VideoClusterDB | None":
+        if not VIDEO_CLUSTER_AVAILABLE or VideoClusterDB is None:
+            return None
+        if self._cluster_db is None:
+            try:
+                self._cluster_db = VideoClusterDB()
+            except Exception as e:
+                logger.warning(f"VideoClusterDB 初期化失敗: {e}")
+                return None
+        return self._cluster_db
+
+    def _on_tag_filter_changed(self, tags: list) -> None:
+        """タグフィルタ変更時にファイルリストのフィルタを更新する。"""
+        self._active_tag_filter = list(tags)
+        self._apply_tag_filter()
+
+    def _apply_tag_filter(self) -> None:
+        """アクティブなタグフィルタをプロキシモデルに反映する。"""
+        if not hasattr(self, 'proxy_model'):
+            return
+        if not self._active_tag_filter:
+            # フィルタ解除
+            if hasattr(self.proxy_model, 'set_tag_filter'):
+                self.proxy_model.set_tag_filter([], None)
+            return
+        db = self._get_cluster_db()
+        if db is None:
+            return
+        matching = set(db.get_videos_with_tags(self._active_tag_filter, self.current_path))
+        if hasattr(self.proxy_model, 'set_tag_filter'):
+            self.proxy_model.set_tag_filter(self._active_tag_filter, matching)
+
+    def _sync_left_pane_to_path(self, path):
+        if self._syncing_left_pane or not path or not os.path.isdir(path):
+            return
+        # select_drive / expand / fetchMore が currentChanged を誘発しないよう
+        # 操作全体をフラグで保護する
+        self._syncing_left_pane = True
+        try:
+            root_changed = False
+            if sys.platform == "win32":
+                drive, _ = os.path.splitdrive(path)
+                if drive:
+                    root_path = os.path.abspath(drive + "\\")
+                    current_root = getattr(self.left_pane, "_current_root_path", "")
+                    root_changed = (
+                        os.path.normcase(root_path) != os.path.normcase(current_root)
+                    )
+                    self.left_pane.select_drive(drive.rstrip(":"))
+            elif path.startswith(os.sep):
+                current_root = getattr(self.left_pane, "_current_root_path", "")
+                root_changed = os.path.normcase(os.sep) != os.path.normcase(current_root)
+                if root_changed:
+                    self.left_pane.select_drive(os.sep)
+
+            if root_changed:
+                self._schedule_tree_sync(path)
+                return
+
+            self._trigger_tree_load_for_path(path)
+            folder_model = self.left_pane.folder_model
+            tree_index = folder_model.index(path)
+            if tree_index.isValid():
+                self._apply_tree_selection(tree_index, path)
+            else:
+                self._schedule_tree_sync(path)
+        except Exception as e:
+            logger.error(f"Error syncing left pane: {e}")
+        finally:
+            self._syncing_left_pane = False
+
+    def _trigger_tree_load_for_path(self, path):
+        folder_model = self.left_pane.folder_model
+        tree_view = self.left_pane.tree_view
+        ancestors: list[str] = []
+        current = path
+        while True:
+            parent = os.path.dirname(current)
+            if parent == current: break
+            ancestors.append(parent)
+            current = parent
+        ancestors.reverse()
+        for ancestor in ancestors:
+            idx = folder_model.index(ancestor)
+            if idx.isValid():
+                tree_view.expand(idx)
+                if folder_model.canFetchMore(idx):
+                    folder_model.fetchMore(idx)
+
+    def _apply_tree_selection(self, tree_index, path):
+        tree_view = self.left_pane.tree_view
+        # 呼び出し元がすでにフラグを立てている場合があるため save/restore する
+        was_syncing = self._syncing_left_pane
+        self._syncing_left_pane = True
+        try:
+            p_idx = tree_index.parent()
+            while p_idx.isValid():
+                tree_view.expand(p_idx)
+                p_idx = p_idx.parent()
+            tree_view.setCurrentIndex(tree_index)
+            item_rect = tree_view.visualRect(tree_index)
+            viewport_rect = tree_view.viewport().rect()
+            if not item_rect.isValid() or not viewport_rect.contains(item_rect):
+                tree_view.scrollTo(tree_index, QAbstractItemView.EnsureVisible)
+        finally:
+            self._syncing_left_pane = was_syncing
+        try:
+            self.settings.setValue("last_left_path", path)
+        except Exception as e:
+            logger.debug(f"Failed to save last_left_path: {e}")
+
+    def _schedule_tree_sync(self, path, attempt=0):
+        if attempt >= 8: return
+        def retry():
+            if getattr(self, 'current_path', None) != path: return
+            if self._syncing_left_pane: return
+            self._syncing_left_pane = True
+            try:
+                self._trigger_tree_load_for_path(path)
+                tree_index = self.left_pane.folder_model.index(path)
+                if tree_index.isValid(): self._apply_tree_selection(tree_index, path)
+                else: self._schedule_tree_sync(path, attempt + 1)
+            finally:
+                self._syncing_left_pane = False
+        QTimer.singleShot(150 * (attempt + 1), retry)
+
+    def _update_nav_buttons(self):
+        self.back_button.setEnabled(bool(self._nav_history))
+        self.forward_button.setEnabled(bool(self._nav_forward_stack))
+
+    def navigate_back(self):
+        if not self._nav_history: return
+        self._nav_forward_stack.append(self.current_path)
+        target = self._nav_history.pop()
+        self._nav_jumping = True
+        try: self.set_current_path(target)
+        finally: self._nav_jumping = False
+        self._update_nav_buttons()
+
+    def navigate_forward(self):
+        if not self._nav_forward_stack: return
+        self._nav_history.append(self.current_path)
+        target = self._nav_forward_stack.pop()
+        self._nav_jumping = True
+        try: self.set_current_path(target)
+        finally: self._nav_jumping = False
+        self._update_nav_buttons()
+
+    def navigate_to_address(self):
+        path = self.address_bar.text().strip()
+        if path and os.path.isdir(path):
+            self.set_current_path(path)
+            self._show_breadcrumb_bar(force=True)
+        else:
+            self.address_bar.setText(self.current_path)
+            self._show_breadcrumb_bar(force=True)
     
     def set_current_path_async(self, path):
-        """非同期でパスを設定"""
-        # プログレスバーを表示
         self.show_right_progress(f"フォルダを読み込み中: {os.path.basename(path)}")
-        
-        # QTimerを使用して非同期風に処理
         QTimer.singleShot(100, lambda: self.load_path_sync(path))
     
     def load_path_sync(self, path):
-        """同期でパスを読み込み"""
         try:
-            # パスの存在確認
             if not os.path.exists(path):
                 raise FileNotFoundError(f"フォルダが見つかりません: {path}")
-            
-            # リストビューのルートを設定（ファイルシステムモデルを使用）
-            file_index = self.file_system_model.index(path)
-            if file_index.isValid():
-                self.list_view.setRootIndex(self.proxy_model.mapFromSource(file_index))
-            
+            source_index = self.file_system_model.setRootPath(path)
+            if not source_index.isValid():
+                source_index = self.file_system_model.index(path)
+            if source_index.isValid():
+                proxy_index = self.proxy_model.mapFromSource(source_index)
+                self.list_view.setRootIndex(proxy_index)
             self.hide_right_progress()
-            
         except Exception as e:
+            logger.error(f"Error loading path {path}: {e}")
             self.hide_right_progress()
             QMessageBox.warning(self, "エラー", f"フォルダの読み込みに失敗しました:\n{str(e)}")
 
     def _restore_current_root_index(self):
-        """モデルリセット後に現在のフォルダ表示を復元"""
-        if not getattr(self, 'list_view', None) or not getattr(self, 'proxy_model', None):
-            return
+        if not self.list_view or not self.proxy_model: return
         current_path = getattr(self, 'current_path', '')
-        if not current_path or not os.path.isdir(current_path):
-            return
+        if not current_path or not os.path.isdir(current_path): return
         try:
             source_index = self.file_system_model.index(current_path)
             if source_index.isValid():
                 proxy_index = self.proxy_model.mapFromSource(source_index)
-                if proxy_index.isValid():
-                    self.list_view.setRootIndex(proxy_index)
-        except Exception:
-            # 復元失敗時はログのみ
-            pass
+                if proxy_index.isValid(): self.list_view.setRootIndex(proxy_index)
+        except Exception as e:
+            logger.debug(f"Failed to restore root index: {e}")
 
     def _restore_path(self, path: str) -> None:
-        if not path or not os.path.isdir(path):
-            return
+        if not path or not os.path.isdir(path): return
         self.current_path = path
         self._restore_current_root_index()
         try:
-            if hasattr(self, 'left_pane') and hasattr(self.left_pane, 'folder_model'):
-                folder_model = self.left_pane.folder_model
-                if folder_model:
-                    tree_index = folder_model.index(path)
-                    if tree_index.isValid():
-                        self.left_pane.tree_view.setCurrentIndex(tree_index)
-        except Exception:
-            pass
+            tree_index = self.left_pane.folder_model.index(path)
+            if tree_index.isValid(): self.left_pane.tree_view.setCurrentIndex(tree_index)
+        except Exception as e:
+            logger.debug(f"Failed to restore path in tree: {e}")
 
     def _ensure_column_width(self, column: int, key: str) -> None:
-        """選択された列が再表示される際に幅を確保"""
-        if not hasattr(self, 'list_view'):
-            return
-        header = getattr(self.list_view, 'header', None)
-        if not header:
-            return
+        header = self.list_view.header()
         try:
-            current_width = header.sectionSize(column)
+            cw = header.sectionSize(column)
         except Exception:
-            current_width = None
-        if current_width is None or current_width <= 12:
-            target_width = self.DEFAULT_COLUMN_WIDTHS.get(key, 140)
-            try:
-                header.resizeSection(column, target_width)
-            except Exception:
-                pass
+            cw = None
+        if cw is None or cw <= 12:
+            target = self.DEFAULT_COLUMN_WIDTHS.get(key, 140)
+            try: header.resizeSection(column, target)
+            except Exception as e: logger.debug(f"Operation failed: {e}")
+
+    def _on_tree_clicked(self, index):
+        if self._syncing_left_pane: return
+        if index.isValid():
+            path = self.left_pane.folder_model.filePath(index)
+            if os.path.isdir(path):
+                if path != self.current_path:
+                    self.set_current_path(path)
+                    self.clear_file_selection()
+                else:
+                    self._sync_left_pane_to_path(path)
+                try: self.settings.setValue("last_left_path", path)
+                except Exception as e: logger.debug(f"Operation failed: {e}")
 
     def on_tree_selection_changed(self, current, previous):
-        """ツリービューの選択変更時の処理"""
-        if current.isValid() and hasattr(self.left_pane, 'folder_model'):
+        if self._syncing_left_pane: return
+        if current.isValid():
             path = self.left_pane.folder_model.filePath(current)
             if os.path.isdir(path):
                 self.set_current_path(path)
-                # 左ペインで選択したパスを保存しておく
-                try:
-                    self.settings.setValue("last_left_path", path)
-                except Exception:
-                    pass
-                
-                # フォルダ変更時に選択状態をクリア
-                self.file_system_model.clear_selection()
-                self.move_to_trash_button.setEnabled(False)
+                try: self.settings.setValue("last_left_path", path)
+                except Exception as e: logger.debug(f"Operation failed: {e}")
+                self.clear_file_selection()
     
     def on_list_double_clicked(self, index):
-        """リストビューのダブルクリック時の処理"""
         if index.isValid():
             source_index = self.proxy_model.mapToSource(index)
             path = self.file_system_model.filePath(source_index)
-            
             if os.path.isdir(path):
                 self.set_current_path(path)
-                
-                # フォルダ変更時に選択状態をクリア
-                self.file_system_model.clear_selection()
-                self.move_to_trash_button.setEnabled(False)
+                self.clear_file_selection()
             else:
-                # ファイルの場合はデフォルトアプリケーションで開く
                 self.open_file(path)
-    
-    def on_list_selection_changed(self, selected, deselected):
-        """リストビューの選択変更時の処理"""
-        indexes = self.list_view.selectedIndexes() if hasattr(self, 'list_view') else []
-        if not indexes:
-            if self.thumbnail_preview:
-                self.thumbnail_preview.display_video(None)
-            return
 
+    def _on_list_middle_clicked(self, index):
+        if getattr(self, 'video_digest_trigger', 'none') != 'middle':
+            return
+        if not index.isValid():
+            return
+        source_index = self.proxy_model.mapToSource(index)
+        path = self.file_system_model.filePath(source_index)
+        if self._is_video_file(path):
+            self.show_video_digest(path)
+
+    def on_list_selection_changed(self, selected, deselected):
+        self._update_selected_file_actions()
+        self.selection_changed.emit()
+        hover_enabled = getattr(self, 'video_hover_thumbnail_enabled', True)
+        indexes = self.list_view.selectedIndexes()
+        if not indexes:
+            if self.thumbnail_preview and hover_enabled: self.thumbnail_preview.display_video(None)
+            return
         index = indexes[0]
         source_index = self.proxy_model.mapToSource(index)
         path = self.file_system_model.filePath(source_index)
-
-        is_video = bool(self.video_digest_generator and self.video_digest_generator.is_video_file(path))
-        if self.thumbnail_preview:
-            if is_video:
-                self.thumbnail_preview.display_video(path)
-            else:
-                self.thumbnail_preview.display_video(None)
-
-        if not is_video:
-            return
-
-        # 自動表示設定をチェック
-        auto_show = getattr(self, 'video_auto_show_digest', False)
-        if auto_show:
-            # 少し遅延してからダイジェストを表示（連続選択を防ぐため）
+        is_video = self._is_video_file(path)
+        if self.thumbnail_preview and hover_enabled:
+            self.thumbnail_preview.display_video(path if is_video else None)
+        if is_video and getattr(self, 'video_auto_show_digest', False):
             QTimer.singleShot(500, lambda: self.show_video_digest(path))
-    
-    def on_checkbox_selection_changed(self, top_left, bottom_right, roles):
-        """チェックボックス選択が変更された時の処理"""
-        if Qt.CheckStateRole in roles:
-            # 選択されたファイル数を取得
-            selected_count = self.file_system_model.get_selected_count()
-            
-            # ゴミ箱移動ボタンの状態を更新
-            self.move_to_trash_button.setEnabled(selected_count > 0)
-            
-            # ステータスバーに選択数を表示
-            if hasattr(self, 'statusBar'):
-                self.statusBar().showMessage(f"選択されたファイル: {selected_count}個")
+
+    def _get_selected_row_indexes(self):
+        if not self.list_view or self.list_view.selectionModel() is None: return []
+        return self.list_view.selectionModel().selectedRows(0)
+
+    def _get_selected_paths(self, *, files_only=False):
+        selected_paths = []
+        seen_paths = set()
+        for index in self._get_selected_row_indexes():
+            source_index = self.proxy_model.mapToSource(index)
+            path = self.file_system_model.filePath(source_index)
+            if not path or path in seen_paths: continue
+            if files_only and not os.path.isfile(path): continue
+            seen_paths.add(path)
+            selected_paths.append(path)
+        return selected_paths
+
+    def _update_selected_file_actions(self):
+        selected_count = len(self._get_selected_paths())
+        self.copy_button.setEnabled(selected_count > 0)
+        self.cut_button.setEnabled(selected_count > 0)
+        self.paste_button.setEnabled(bool(self._clipboard_paths))
+        self.delete_button.setEnabled(selected_count > 0)
+        self.move_to_trash_button.setEnabled(selected_count > 0)
+        if hasattr(self, 'video_player_button'):
+            self.video_player_button.setEnabled(
+                VIDEO_PLAYER_AVAILABLE
+                and getattr(self, 'video_player_enabled', True)
+                and bool(self._get_selected_video_path())
+            )
 
     def on_list_view_entered(self, index):
-        """リストビューでアイテムにマウスが乗った時の処理"""
-        if not index.isValid():
-             return
-
-        # プロキシモデル経由でソースインデックスを取得
+        if not index.isValid() or not getattr(self, 'video_hover_thumbnail_enabled', True): return
         source_index = self.proxy_model.mapToSource(index)
         path = self.file_system_model.filePath(source_index)
-        
-        # 動画ファイルか判定
-        is_video = bool(self.video_digest_generator and self.video_digest_generator.is_video_file(path))
-        if is_video and self.thumbnail_preview:
+        if self._is_video_file(path) and self.thumbnail_preview:
              self.thumbnail_preview.display_video(path)
     
     def show_file_search_dialog(self):
-        """ファイル検索ダイアログを表示（呼び出し時にモジュールをロード）"""
         try:
-            # パッケージ名を明示して動的にインポート
             import importlib
-            mod = importlib.import_module('file_manager.file_search_dialog')
+            mod = importlib.import_module('.file_search_dialog', package='file_manager')
             DialogClass = getattr(mod, 'FileSearchDialog')
-        except Exception:
-            QMessageBox.warning(self, "エラー", "ファイル検索機能が利用できません（モジュールが見つかりません）。")
-            return
-
-        try:
-            dialog = DialogClass(self)
-            dialog.exec()
+            DialogClass(self).exec()
         except Exception as e:
-            QMessageBox.warning(self, "エラー", f"ファイル検索ダイアログの表示中にエラーが発生しました: {str(e)}")
+            logger.error(f"Error showing search dialog: {e}")
+            QMessageBox.warning(self, "エラー", f"ファイル検索ダイアログの表示中にエラーが発生しました: {e}")
     
     def show_duplicate_videos_dialog(self, target_path=None):
-        """選択中フォルダ内の重複動画リストを表示"""
-        if not bool(VideoDuplicatesDialog):
+        if not VideoDuplicatesDialog:
             QMessageBox.warning(self, "エラー", "重複動画検出機能を利用できません。")
             return
-
-        if isinstance(target_path, bool) or target_path is None:
-            target_path = self.current_path
-
-        if not target_path or not os.path.isdir(target_path):
-            QMessageBox.information(self, "情報", "フォルダを選択してください。")
-            return
-
-        try:
-            dialog = VideoDuplicatesDialog(target_path, self)
-            dialog.exec()
-        except Exception as error:
-            QMessageBox.warning(
-                self,
-                "エラー",
-                "重複動画の表示中にエラーが発生しました:\n{0}".format(error),
-            )
+        if target_path is None or isinstance(target_path, bool): target_path = self.current_path
+        if not target_path or not os.path.isdir(target_path): return
+        try: VideoDuplicatesDialog(target_path, self).exec()
+        except Exception as e:
+            logger.error(f"Error showing duplicates dialog: {e}")
+            QMessageBox.warning(self, "エラー", f"重複動画の表示中にエラーが発生しました: {e}")
 
     def show_filename_similarity_dialog(self, target_path=None):
-        """選択中フォルダ内のファイル名が類似したファイルを表示"""
-        if not bool(FilenameSimilarityDialog):
+        if not FilenameSimilarityDialog:
             QMessageBox.warning(self, "エラー", "ファイル名類似度検出機能を利用できません。")
             return
-
-        if isinstance(target_path, bool) or target_path is None:
-            target_path = self.current_path
-
-        if not target_path or not os.path.isdir(target_path):
-            QMessageBox.information(self, "情報", "フォルダを選択してください。")
-            return
-
+        if target_path is None or isinstance(target_path, bool): target_path = self.current_path
+        if not target_path or not os.path.isdir(target_path): return
         try:
-            dialog = FilenameSimilarityDialog(target_path, self)
-            dialog.exec()
-        except Exception as error:
-            QMessageBox.warning(
-                self,
-                "エラー",
-                "ファイル名類似度検出中にエラーが発生しました:\n{0}".format(error),
-            )
+            FilenameSimilarityDialog(target_path, self).exec()
+            self.list_view.clearSelection()
+        except Exception as e:
+            logger.error(f"Error showing similarity dialog: {e}")
+            QMessageBox.warning(self, "エラー", f"ファイル名類似度検出中にエラーが発生しました: {e}")
 
     def show_same_filesize_dialog(self, target_path=None):
-        """選択中フォルダ内の同じファイルサイズのファイルを表示"""
-        if not bool(SameFileSizeDialog):
+        if not SameFileSizeDialog:
             QMessageBox.warning(self, "エラー", "同じファイルサイズ検出機能を利用できません。")
             return
-
-        if isinstance(target_path, bool) or target_path is None:
-            target_path = self.current_path
-
-        if not target_path or not os.path.isdir(target_path):
-            QMessageBox.information(self, "情報", "フォルダを選択してください。")
-            return
-
-        try:
-            dialog = SameFileSizeDialog(self, target_path)
-            dialog.exec()
-        except Exception as error:
-            QMessageBox.warning(
-                self,
-                "エラー",
-                "同じファイルサイズ検出中にエラーが発生しました:\n{0}".format(error),
-            )
+        if target_path is None or isinstance(target_path, bool): target_path = self.current_path
+        if not target_path or not os.path.isdir(target_path): return
+        try: SameFileSizeDialog(self, target_path).exec()
+        except Exception as e:
+            logger.error(f"Error showing same size dialog: {e}")
+            QMessageBox.warning(self, "エラー", f"同じファイルサイズ検出中にエラーが発生しました: {e}")
 
     def show_disk_analysis_dialog(self):
-        """ディスク分析ダイアログを表示（呼び出し時にモジュールをロード）"""
         try:
             import importlib
-            mod = importlib.import_module('file_manager.disk_analysis_dialog')
+            mod = importlib.import_module('.disk_analysis_dialog', package='file_manager')
             DialogClass = getattr(mod, 'DiskAnalysisDialog')
-        except Exception:
-            QMessageBox.warning(self, "エラー", "ディスク分析機能が利用できません（モジュールが見つかりません）。")
-            return
-
-        try:
-            # 現在のパスを初期パスとして使用
-            dialog = DialogClass(self.current_path, self)
-            dialog.exec()
+            DialogClass(self.current_path, self).exec()
         except Exception as e:
-            QMessageBox.warning(self, "エラー", f"ディスク分析ダイアログの表示中にエラーが発生しました: {str(e)}")
-    
+            logger.error(f"Error showing disk analysis dialog: {e}")
+            QMessageBox.warning(self, "エラー", f"ディスク分析ダイアログの表示中にエラーが発生しました: {e}")
+
+    # ------------------------------------------------------------------
+    # 動画クラスタリング
+    # ------------------------------------------------------------------
+    def show_video_cluster_scan_dialog(self, folder: str = "") -> None:
+        if not VIDEO_CLUSTER_AVAILABLE or VideoClusterScanDialog is None:
+            QMessageBox.information(self, "未対応", "動画クラスタリング機能が利用できません。")
+            return
+        db = self._get_cluster_db()
+        if db is None:
+            QMessageBox.warning(self, "エラー", "クラスタリングDBの初期化に失敗しました。")
+            return
+        dlg = VideoClusterScanDialog(db, folder or self.current_path, self)
+        dlg.exec()
+        # スキャン後にタグフィルタを更新
+        self._refresh_tag_filter(self.current_path)
+
+    def show_video_cluster_browser(self) -> None:
+        if not VIDEO_CLUSTER_AVAILABLE or VideoClusterBrowserDialog is None:
+            QMessageBox.information(self, "未対応", "動画クラスタリング機能が利用できません。")
+            return
+        db = self._get_cluster_db()
+        if db is None:
+            QMessageBox.warning(self, "エラー", "クラスタリングDBの初期化に失敗しました。")
+            return
+        VideoClusterBrowserDialog(db, self).exec()
+
     def move_selected_files_to_trash(self):
-        """選択されたファイルをゴミ箱に移動"""
-        selected_files = self.file_system_model.get_selected_files()
-        
-        if not selected_files:
-            QMessageBox.information(self, "情報", "移動するファイルが選択されていません。")
-            return
-        
-        # 確認ダイアログ
-        reply = QMessageBox.question(
-            self, 
-            "確認", 
-            f"{len(selected_files)}個のファイルをゴミ箱に移動しますか？",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
-        )
-        
-        if reply != QMessageBox.Yes:
-            return
-        
-        # ゴミ箱移動の実行
-        moved_count = 0
-        failed_files = []
-        
-        for file_path in selected_files:
+        selected_paths = self._get_selected_paths()
+        if not selected_paths: return
+        moved_count, failed_files = 0, []
+        for path in selected_paths:
             try:
-                if self.move_to_trash(file_path):
-                    moved_count += 1
-                else:
-                    failed_files.append(file_path)
-            except Exception as e:
-                failed_files.append(f"{file_path} (エラー: {str(e)})")
-        
-        # 結果を表示
+                if self.move_to_trash(path): moved_count += 1
+                else: failed_files.append(path)
+            except Exception as e: failed_files.append(f"{path} ({e})")
         if moved_count > 0:
-            # 選択をクリア
-            self.file_system_model.clear_selection()
-            self.move_to_trash_button.setEnabled(False)
-            
-            # ファイルリストを更新
+            self.clear_file_selection()
             self.refresh()
-            
-            message = f"{moved_count}個のファイルをゴミ箱に移動しました。"
             if failed_files:
-                message += f"\n\n移動に失敗したファイル:\n" + "\n".join(failed_files)
-            
-            QMessageBox.information(self, "完了", message)
-        else:
-            QMessageBox.warning(self, "エラー", "ファイルの移動に失敗しました。")
+                silent_warning(self, "一部失敗", f"{moved_count}個移動。失敗:\n" + "\n".join(failed_files))
+        else: silent_warning(self, "エラー", "アイテムの移動に失敗しました。")
     
     def move_to_trash(self, file_path):
-        """ファイルをゴミ箱に移動"""
         try:
-            if sys.platform == "win32":
-                # Windowsの場合
-                try:
-                    try:
-                        import winshell
-                    except ImportError:
-                        winshell = None
-                        print("winshell モジュールが見つかりません。ゴミ箱移動は無効化されます。")
-                    winshell.delete_file(file_path, no_confirm=True, allow_undo=True)
-                    return True
-                except ImportError:
-                    # winshellが利用できない場合は標準的な削除
-                    import shutil
-                    shutil.move(file_path, os.path.expanduser("~/.local/share/Trash/files/"))
-                    return True
-            else:
-                # macOS/Linuxの場合
-                try:
-                    import send2trash
-                    send2trash.send2trash(file_path)
-                    return True
-                except ImportError:
-                    # send2trashが利用できない場合は標準的な削除
-                    import shutil
-                    trash_dir = os.path.expanduser("~/.local/share/Trash/files/")
-                    os.makedirs(trash_dir, exist_ok=True)
-                    shutil.move(file_path, trash_dir)
-                    return True
+            import send2trash
+            # send2trash は \\?\ プレフィックスを付加するため、バックスラッシュに正規化する
+            normalized = os.path.normpath(file_path)
+            send2trash.send2trash(normalized)
+            return True
+        except ImportError:
+            pass
         except Exception as e:
-            print(f"ゴミ箱移動エラー ({file_path}): {e}")
+            logger.error(f"Trash error ({file_path}): {e}")
             return False
+        # send2trash が無い場合は winshell にフォールバック（Windows）
+        if sys.platform == "win32":
+            try:
+                import winshell
+                winshell.delete_file(file_path, no_confirm=True, allow_undo=True)
+                return True
+            except ImportError:
+                logger.error("send2trash および winshell が見つかりません")
+            except Exception as e:
+                logger.error(f"Trash error ({file_path}): {e}")
+        else:
+            logger.error("send2trash が見つかりません")
+        return False
     
     def select_all_files(self):
-        """全てのファイルを選択"""
-        self.file_system_model.select_all_files()
-        self.move_to_trash_button.setEnabled(True)
+        self.list_view.selectAll()
+        self._update_selected_file_actions()
     
     def clear_file_selection(self):
-        """ファイル選択をクリア"""
-        self.file_system_model.clear_selection()
-        self.move_to_trash_button.setEnabled(False)
+        self.list_view.clearSelection()
+        self._update_selected_file_actions()
     
     def open_file(self, file_path):
-        """ファイルをデフォルトアプリケーションで開く"""
         try:
-            if sys.platform == "win32":
-                os.startfile(file_path)
-            elif sys.platform == "darwin":
-                os.system(f"open '{file_path}'")
-            else:
-                os.system(f"xdg-open '{file_path}'")
+            if sys.platform == "win32": os.startfile(file_path)
+            elif sys.platform == "darwin": os.system(f"open '{file_path}'")
+            else: os.system(f"xdg-open '{file_path}'")
         except Exception as e:
+            logger.error(f"Error opening file {file_path}: {e}")
             QMessageBox.warning(self, "エラー", f"ファイルを開けませんでした: {e}")
-    
-    def show_tree_context_menu(self, position):
-        """左ペインツリーのコンテキストメニューを表示"""
-        index = self.left_pane.tree_view.indexAt(position)
-        if not index.isValid():
+
+    def _get_selected_video_path(self) -> str | None:
+        for path in self._get_selected_paths(files_only=True):
+            if self._is_video_file(path):
+                return path
+        return None
+
+    def _ensure_video_player_window(self):
+        if not VIDEO_PLAYER_AVAILABLE or VideoPlayerWindow is None:
+            return None
+        if self._video_player_window is None:
+            self._video_player_window = VideoPlayerWindow(
+                self,
+                settings=self.settings,
+                default_speed=getattr(self, 'video_player_default_speed', 1.0),
+                default_muted=getattr(self, 'video_player_default_muted', True),
+            )
+        return self._video_player_window
+
+    def open_selected_video_player(self):
+        if not getattr(self, 'video_player_enabled', True):
             return
+        path = self._get_selected_video_path()
+        if not path:
+            return
+        player_window = self._ensure_video_player_window()
+        if player_window is None:
+            QMessageBox.warning(self, "エラー", "動画プレーヤー機能を利用できません。")
+            return
+        player_window.load_video(
+            path,
+            autoplay=getattr(self, 'video_player_autoplay', True),
+        )
 
-        menu = QMenu(self)
-        folder_path = self.left_pane.folder_model.filePath(index) if hasattr(self.left_pane, 'folder_model') else None
+    def on_files_dropped_to_folder(self, source_paths, target_path):
+        if not source_paths or not target_path: return
+        operation = self._prompt_drop_operation(source_paths, target_path)
+        if operation is None: return
+        success_count, errors = self._transfer_paths_to_directory(
+            source_paths,
+            target_path,
+            move=(operation == "move"),
+            confirm_overwrite=True,
+        )
+        if success_count > 0:
+            self.clear_file_selection()
+            self.refresh()
+        if errors:
+            QMessageBox.warning(self, "エラー", f"{success_count}件処理、{len(errors)}件失敗:\n" + "\n".join(errors[:5]))
 
-        # 新規フォルダ
-        new_folder_action = QAction("新規フォルダ", self)
-        new_folder_action.triggered.connect(self.create_new_folder)
-        menu.addAction(new_folder_action)
+    def _prompt_drop_operation(self, source_paths, target_path):
+        mb = QMessageBox(self)
+        mb.setIcon(QMessageBox.Question)
+        mb.setWindowTitle("ドロップ操作")
+        mb.setText(f"{len(source_paths)} 件を {target_path} へコピーまたは移動します。")
+        c_btn = mb.addButton("コピー", QMessageBox.AcceptRole)
+        m_btn = mb.addButton("移動", QMessageBox.ActionRole)
+        cancel_btn = mb.addButton("キャンセル", QMessageBox.RejectRole)
+        mb.exec()
+        clicked = mb.clickedButton()
+        if clicked == c_btn: return "copy"
+        if clicked == m_btn: return "move"
+        return None
 
-        # 更新
-        refresh_action = QAction("更新", self)
-        refresh_action.triggered.connect(self.refresh)
-        menu.addAction(refresh_action)
+    def _transfer_paths_to_directory(self, source_paths, target_path, *, move=False, confirm_overwrite=False):
+        success_count, errors = 0, []
+        if not os.path.isdir(target_path): return 0, [f"保存先不明: {target_path}"]
+        for sp in source_paths:
+            try:
+                dp = os.path.join(target_path, os.path.basename(sp))
+                if os.path.abspath(sp) == os.path.abspath(dp): continue
+                if os.path.exists(dp) and confirm_overwrite:
+                    if not self._confirm_overwrite_destination(sp, dp):
+                        break
+                    self._remove_existing_path(dp)
+                if os.path.exists(dp): errors.append(f"{dp}: 存在します"); continue
+                if move: shutil.move(sp, dp)
+                elif os.path.isdir(sp): shutil.copytree(sp, dp)
+                else: shutil.copy2(sp, dp)
+                success_count += 1
+            except Exception as e: errors.append(f"{sp}: {e}")
+        return success_count, errors
 
-        menu.addSeparator()
+    def _confirm_overwrite_destination(self, source_path, destination_path):
+        source_size = self._path_size(source_path)
+        destination_size = self._path_size(destination_path)
+        message = (
+            "同名のファイルまたはフォルダが既に存在します。\n\n"
+            f"移動/コピーする項目:\n{source_path}\n"
+            f"サイズ: {self._format_byte_size(source_size)}\n\n"
+            f"既存の項目:\n{destination_path}\n"
+            f"サイズ: {self._format_byte_size(destination_size)}\n\n"
+            "既存の項目を上書きしますか？"
+        )
+        reply = QMessageBox.question(
+            self,
+            "上書き確認",
+            message,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return reply == QMessageBox.Yes
 
-        if bool(VideoDuplicatesDialog) and folder_path:
-            duplicate_action = QAction("重複動画を検出", self)
-            duplicate_action.triggered.connect(lambda: self.show_duplicate_videos_dialog(folder_path))
-            menu.addAction(duplicate_action)
+    def _remove_existing_path(self, path):
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+        else:
+            os.remove(path)
 
-        if bool(FilenameSimilarityDialog) and folder_path:
-            similarity_action = QAction("類似ファイル名を検出", self)
-            similarity_action.triggered.connect(lambda: self.show_filename_similarity_dialog(folder_path))
-            menu.addAction(similarity_action)
+    def _path_size(self, path):
+        try:
+            if os.path.isfile(path) or os.path.islink(path):
+                return os.path.getsize(path)
+            if os.path.isdir(path):
+                total = 0
+                for root, _, files in os.walk(path):
+                    for name in files:
+                        file_path = os.path.join(root, name)
+                        try:
+                            total += os.path.getsize(file_path)
+                        except OSError:
+                            pass
+                return total
+        except OSError:
+            pass
+        return None
 
-        if (bool(VideoDuplicatesDialog) or bool(FilenameSimilarityDialog)) and folder_path:
-            menu.addSeparator()
+    @staticmethod
+    def _format_byte_size(size):
+        if size is None:
+            return "不明"
+        value = float(max(0, size))
+        units = ("B", "KB", "MB", "GB", "TB", "PB")
+        for unit in units:
+            if value < 1024.0 or unit == units[-1]:
+                if unit == "B":
+                    return f"{int(value)} B"
+                return f"{value:.1f} {unit}"
+            value /= 1024.0
 
-        # ディスク解析
-        if DISK_ANALYSIS_AVAILABLE:
-            disk_analysis_action = QAction("ディスク使用率分析", self)
-            disk_analysis_action.triggered.connect(self.show_disk_analysis_dialog)
-            menu.addAction(disk_analysis_action)
-
+    def show_tree_context_menu(self, position):
+        index = self.left_pane.tree_view.indexAt(position)
+        if not index.isValid(): return
+        menu = self._build_tree_context_menu(index)
         menu.exec(self.left_pane.tree_view.mapToGlobal(position))
 
-    def show_list_context_menu(self, position):
-        """リストビューのコンテキストメニューを表示"""
-        index = self.list_view.indexAt(position)
-        if not index.isValid():
-            return
-        
+    def _build_tree_context_menu(self, index) -> QMenu:
         menu = QMenu(self)
-        
-        # ファイル操作メニュー
-        open_action = QAction("開く", self)
-        open_action.triggered.connect(self.open_selected_file)
-        menu.addAction(open_action)
-        
-        # 動画ファイルの場合はダイジェスト表示オプションを追加
+        fp = self.left_pane.folder_model.filePath(index)
+        menu.addAction("新規フォルダ", self.create_new_folder)
+        menu.addAction("更新", self.refresh)
+        menu.addSeparator()
+        if VideoDuplicatesDialog and fp:
+            action = menu.addAction("重複動画を検出")
+            action.setData(fp)
+            action.triggered.connect(self._show_tree_duplicate_action)
+        if FilenameSimilarityDialog and fp:
+            action = menu.addAction("類似ファイル名を検出")
+            action.setData(fp)
+            action.triggered.connect(self._show_tree_similarity_action)
+        if DISK_ANALYSIS_AVAILABLE:
+            menu.addAction("ディスク使用率分析", self.show_disk_analysis_dialog)
+        if VIDEO_CLUSTER_AVAILABLE and fp:
+            menu.addSeparator()
+            menu.addAction("動画クラスタリング — フォルダをスキャン", partial(self.show_video_cluster_scan_dialog, fp))
+            menu.addAction("動画クラスタリング — 結果を表示", self.show_video_cluster_browser)
+        return menu
+
+    def _show_tree_duplicate_action(self, _checked=False):
+        action = self.sender()
+        path = action.data() if isinstance(action, QAction) else None
+        self.show_duplicate_videos_dialog(path)
+
+    def _show_tree_similarity_action(self, _checked=False):
+        action = self.sender()
+        path = action.data() if isinstance(action, QAction) else None
+        self.show_filename_similarity_dialog(path)
+
+    def _build_list_context_menu(self, index) -> QMenu:
+        menu = QMenu(self)
+        menu.addAction("開く", self.open_selected_file)
         source_index = self.proxy_model.mapToSource(index)
         path = self.file_system_model.filePath(source_index)
-        if self.video_digest_generator and self.video_digest_generator.is_video_file(path):
-            digest_action = QAction("動画ダイジェストを表示", self)
-            digest_action.triggered.connect(lambda: self.show_video_digest(path))
-            menu.addAction(digest_action)
-        
+        if self._is_video_file(path):
+            player_action = menu.addAction("動画を別ウィンドウで再生", self.open_selected_video_player)
+            player_action.setEnabled(
+                VIDEO_PLAYER_AVAILABLE and getattr(self, 'video_player_enabled', True)
+            )
+            menu.addAction("動画ダイジェストを表示", partial(self.show_video_digest, path))
         menu.addSeparator()
-        
-        copy_action = QAction("コピー", self)
-        copy_action.triggered.connect(self.copy_selected_files)
-        menu.addAction(copy_action)
-        
-        cut_action = QAction("切り取り", self)
-        cut_action.triggered.connect(self.cut_selected_files)
-        menu.addAction(cut_action)
-        
-        paste_action = QAction("貼り付け", self)
-        paste_action.triggered.connect(self.paste_files)
-        menu.addAction(paste_action)
-        
+        selected = bool(self._get_selected_paths())
+        copy_action = menu.addAction("コピー", self.copy_selected_files)
+        copy_action.setEnabled(selected)
+        cut_action = menu.addAction("切り取り", self.cut_selected_files)
+        cut_action.setEnabled(selected)
+        paste_action = menu.addAction("貼り付け", self.paste_files)
+        paste_action.setEnabled(bool(self._clipboard_paths))
         menu.addSeparator()
-        
-        rename_action = QAction("名前変更", self)
-        rename_action.triggered.connect(self.rename_selected_file)
-        menu.addAction(rename_action)
-        
-        delete_action = QAction("削除", self)
-        delete_action.triggered.connect(self.delete_selected_files)
-        menu.addAction(delete_action)
-        
+        menu.addAction("名前変更", self.rename_selected_file)
+        t_act = menu.addAction("ファイル名を日本語に翻訳", self.translate_selected_filenames)
+        t_act.setEnabled(TRANSLATION_FEATURE_AVAILABLE and bool(self._get_selected_file_paths()))
+        attr_menu = menu.addMenu("属性を変更")
+        attr_targets = bool(self._get_selected_paths(files_only=True))
+        normal_attr = attr_menu.addAction("通常")
+        normal_attr.triggered.connect(lambda: self.change_selected_file_attribute("normal"))
+        readonly_attr = attr_menu.addAction("読み取り専用")
+        readonly_attr.triggered.connect(lambda: self.change_selected_file_attribute("readonly"))
+        hidden_attr = attr_menu.addAction("隠し")
+        hidden_attr.triggered.connect(lambda: self.change_selected_file_attribute("hidden"))
+        attr_menu.setEnabled(attr_targets)
+        menu.addAction("削除", self.delete_selected_files)
         menu.addSeparator()
-        
-        # 選択関連のアクション
-        select_all_action = QAction("全て選択", self)
-        select_all_action.triggered.connect(self.select_all_files)
-        menu.addAction(select_all_action)
-        
-        clear_selection_action = QAction("選択解除", self)
-        clear_selection_action.triggered.connect(self.clear_file_selection)
-        menu.addAction(clear_selection_action)
-        
-        # 選択したファイルをゴミ箱に移動
-        move_to_trash_action = QAction("選択したファイルをゴミ箱に移動", self)
-        move_to_trash_action.triggered.connect(self.move_selected_files_to_trash)
-        move_to_trash_action.setEnabled(self.file_system_model.get_selected_count() > 0)
-        menu.addAction(move_to_trash_action)
-        
-        menu.exec(self.list_view.mapToGlobal(position))
+        menu.addAction("全て選択", self.select_all_files)
+        menu.addAction("選択解除", self.clear_file_selection)
+        trash_act = menu.addAction("選択したファイルをゴミ箱に移動", self.move_selected_files_to_trash)
+        trash_act.setEnabled(bool(self._get_selected_paths(files_only=True)))
+        return menu
+
+    def show_list_context_menu(self, position):
+        index = self.list_view.indexAt(position)
+        if not index.isValid(): return
+        selection = self.list_view.selectionModel()
+        if selection is not None and not selection.isSelected(index):
+            selection.select(index, QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows)
+            self.list_view.setCurrentIndex(index)
+        self._build_list_context_menu(index).exec(self.list_view.mapToGlobal(position))
+
+    def change_selected_file_attribute(self, attribute):
+        paths = self._get_selected_paths(files_only=True)
+        if not paths:
+            return
+
+        errors = []
+        for path in paths:
+            try:
+                self._set_file_attribute(path, attribute)
+            except Exception as e:
+                errors.append(f"{path}: {e}")
+
+        self.refresh()
+        if errors:
+            QMessageBox.warning(
+                self,
+                "属性変更エラー",
+                f"{len(errors)} 件の属性変更に失敗しました。\n" + "\n".join(errors[:5]),
+            )
+
+    def _set_file_attribute(self, path, attribute):
+        if attribute not in {"normal", "readonly", "hidden"}:
+            raise ValueError(f"Unsupported attribute: {attribute}")
+        if not os.path.isfile(path):
+            raise FileNotFoundError(path)
+
+        if sys.platform == "win32":
+            self._set_windows_file_attribute(path, attribute)
+            return
+
+        self._set_posix_file_attribute(path, attribute)
+
+    def _set_windows_file_attribute(self, path, attribute):
+        import ctypes
+
+        readonly = 0x01
+        hidden = 0x02
+        invalid = 0xFFFFFFFF
+        kernel32 = ctypes.windll.kernel32
+        attrs = kernel32.GetFileAttributesW(str(path))
+        if attrs == invalid:
+            raise OSError(f"属性を取得できません: {path}")
+
+        if attribute == "normal":
+            attrs &= ~readonly
+            attrs &= ~hidden
+        elif attribute == "readonly":
+            attrs |= readonly
+            attrs &= ~hidden
+        elif attribute == "hidden":
+            attrs |= hidden
+            attrs &= ~readonly
+
+        if not kernel32.SetFileAttributesW(str(path), attrs):
+            raise OSError(f"属性を変更できません: {path}")
+
+    def _set_posix_file_attribute(self, path, attribute):
+        mode = os.stat(path).st_mode
+        if attribute == "readonly":
+            os.chmod(path, mode & ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
+            self._rename_hidden_path(path, hidden=False)
+        elif attribute == "hidden":
+            os.chmod(path, mode | stat.S_IWUSR)
+            self._rename_hidden_path(path, hidden=True)
+        else:
+            os.chmod(path, mode | stat.S_IWUSR)
+            self._rename_hidden_path(path, hidden=False)
+
+    def _rename_hidden_path(self, path, *, hidden):
+        directory = os.path.dirname(path)
+        name = os.path.basename(path)
+        if not name:
+            return path
+        if hidden:
+            if name.startswith("."):
+                return path
+            new_path = os.path.join(directory, f".{name}")
+        else:
+            if not name.startswith("."):
+                return path
+            new_name = name.lstrip(".")
+            if not new_name:
+                return path
+            new_path = os.path.join(directory, new_name)
+        if os.path.exists(new_path):
+            raise FileExistsError(new_path)
+        os.rename(path, new_path)
+        return new_path
     
     def create_new_folder(self):
-        """新規フォルダを作成"""
-        folder_name, ok = QInputDialog.getText(
-            self, "新規フォルダ", "フォルダ名を入力してください:"
-        )
-        
-        if ok and folder_name:
+        name, ok = QInputDialog.getText(self, "新規フォルダ", "フォルダ名を入力してください:")
+        if ok and name:
             try:
-                new_folder_path = os.path.join(self.current_path, folder_name)
-                os.makedirs(new_folder_path, exist_ok=True)
+                os.makedirs(os.path.join(self.current_path, name), exist_ok=True)
                 self.refresh()
             except Exception as e:
+                logger.error(f"Failed to create folder: {e}")
                 QMessageBox.warning(self, "エラー", f"フォルダを作成できませんでした: {e}")
     
     def refresh(self):
-        """表示を更新"""
         try:
-            # 現在のパスを保存
-            old_path = self.current_path
-
-            # ファイルシステムモデルの更新
+            old = self.current_path
+            exp = self._capture_left_pane_expansion()
             self.file_system_model.beginResetModel()
             self.file_system_model.endResetModel()
-
-            # 左ペインのフォルダモデルの更新
             if hasattr(self.left_pane, 'folder_model'):
                 self.left_pane.folder_model.beginResetModel()
                 self.left_pane.folder_model.endResetModel()
-
-            # 現在のパスを再設定（非同期）
-            self.set_current_path_async(old_path)
-
+            self.set_current_path_async(old)
+            self._sync_left_pane_to_path(old)
+            self._restore_left_pane_expansion(exp)
         except Exception as e:
-            print(f"更新エラー: {e}")
-            # フォールバック
+            logger.error(f"Refresh error: {e}")
             self.set_current_path_async(self.current_path)
+
+    def _capture_left_pane_expansion(self):
+        paths = []
+        tv, fm = self.left_pane.tree_view, self.left_pane.folder_model
+        def _walk(p_idx):
+            try: rows = fm.rowCount(p_idx)
+            except Exception: return
+            for r in range(rows):
+                idx = fm.index(r, 0, p_idx)
+                if idx.isValid() and tv.isExpanded(idx):
+                    paths.append(fm.filePath(idx))
+                    _walk(idx)
+        try: _walk(tv.rootIndex())
+        except Exception as e: logger.debug(f"Operation failed: {e}")
+        return paths
+
+    def _restore_left_pane_expansion(self, paths, attempt=0):
+        if not paths or attempt >= 8: return
+        tv, fm = self.left_pane.tree_view, self.left_pane.folder_model
+        pending = []
+        for p in sorted(paths, key=lambda x: x.count(os.sep)):
+            idx = fm.index(p)
+            if idx.isValid():
+                tv.expand(idx)
+                if fm.canFetchMore(idx): fm.fetchMore(idx)
+            else: pending.append(p)
+        if pending: QTimer.singleShot(150 * (attempt + 1), lambda: self._restore_left_pane_expansion(pending, attempt + 1))
     
     def open_selected_file(self):
-        """選択されたファイルを開く"""
-        indexes = self.list_view.selectedIndexes()
-        if indexes:
-            index = indexes[0]
-            source_index = self.proxy_model.mapToSource(index)
-            path = self.file_system_model.filePath(source_index)
+        idxs = self.list_view.selectedIndexes()
+        if idxs:
+            path = self.file_system_model.filePath(self.proxy_model.mapToSource(idxs[0]))
             self.open_file(path)
     
     def copy_selected_files(self):
-        """選択されたファイルをコピー"""
-        # 将来実装: クリップボードへのコピー
-        pass
-    
-    def cut_selected_files(self):
-        """選択されたファイルを切り取り"""
-        # 将来実装: クリップボードへの切り取り
-        pass
-    
-    def paste_files(self):
-        """ファイルを貼り付け"""
-        # 将来実装: クリップボードからの貼り付け
-        pass
-    
-    def rename_selected_file(self):
-        """選択されたファイルの名前を変更"""
-        indexes = self.list_view.selectedIndexes()
-        if not indexes:
+        paths = self._get_selected_paths()
+        if not paths:
             return
-        
-        index = indexes[0]
-        source_index = self.proxy_model.mapToSource(index)
-        current_name = self.file_system_model.fileName(source_index)
-        
-        new_name, ok = QInputDialog.getText(
-            self, "名前変更", "新しい名前を入力してください:", text=current_name
+        self._clipboard_paths = paths
+        self._clipboard_move = False
+        self._update_selected_file_actions()
+
+    def cut_selected_files(self):
+        paths = self._get_selected_paths()
+        if not paths:
+            return
+        self._clipboard_paths = paths
+        self._clipboard_move = True
+        self._update_selected_file_actions()
+
+    def paste_files(self):
+        if not self._clipboard_paths:
+            return
+        target_path = self.current_path
+        if not target_path or not os.path.isdir(target_path):
+            silent_warning(self, "エラー", "貼り付け先フォルダが見つかりません。")
+            return
+
+        copied_paths = list(self._clipboard_paths)
+        moved = self._clipboard_move
+        success_count, errors = self._transfer_paths_to_directory(
+            copied_paths,
+            target_path,
+            move=moved,
         )
-        
-        if ok and new_name and new_name != current_name:
+        if success_count > 0:
+            if moved:
+                self._clipboard_paths = []
+                self._clipboard_move = False
+            self.clear_file_selection()
+            self.refresh()
+        if errors:
+            message = f"{success_count}件処理、{len(errors)}件失敗:\n"
+            silent_warning(self, "エラー", message + "\n".join(errors[:5]))
+        self._update_selected_file_actions()
+
+    def rename_selected_file(self):
+        idxs = self.list_view.selectedIndexes()
+        if not idxs: return
+        source_idx = self.proxy_model.mapToSource(idxs[0])
+        curr = self.file_system_model.fileName(source_idx)
+        name, ok = QInputDialog.getText(self, "名前変更", "新しい名前を入力してください:", text=curr)
+        if ok and name and name != curr:
             try:
-                old_path = self.file_system_model.filePath(source_index)
-                new_path = os.path.join(os.path.dirname(old_path), new_name)
-                os.rename(old_path, new_path)
+                old = self.file_system_model.filePath(source_idx)
+                os.rename(old, os.path.join(os.path.dirname(old), name))
                 self.refresh()
             except Exception as e:
+                logger.error(f"Rename error: {e}")
                 QMessageBox.warning(self, "エラー", f"名前を変更できませんでした: {e}")
+
+    def _get_selected_file_paths(self):
+        return [Path(p) for p in self._get_selected_paths(files_only=True)]
+
+    def translate_selected_filenames(self):
+        if not TRANSLATION_FEATURE_AVAILABLE or not FilenameTranslationService: return
+        paths = self._get_selected_file_paths()
+        if not paths: return
+        ts = FilenameTranslationService.from_env()
+        if ts.requires_api_key and not ts.api_key:
+            silent_information(self, "翻訳", f"APIキー未設定: {TRANSLATION_API_ENV_KEY}")
+            return
+        dialog = TranslatePreviewDialog(self, ts, paths)
+        if dialog.exec() != QDialog.Accepted: return
+        cands = dialog.get_selected_candidates()
+        if not cands: return
+        sum = RenameSummary()
+        for c in cands:
+            if not getattr(c, "is_ready", False): sum.skipped_count += 1; continue
+            try:
+                target = c.source_path.with_name(c.translated_name)
+                _rename_file_without_overwrite(c.source_path, target)
+                sum.renamed_count += 1
+            except Exception as e: sum.error_messages.append(f"{c.original_name}: {e}")
+        self.refresh()
+        if sum.error_messages:
+            silent_warning(self, "リネーム結果", f"成功: {sum.renamed_count}, 失敗: {len(sum.error_messages)}\n" + "\n".join(sum.error_messages[:5]))
     
     def delete_selected_files(self):
-        """選択されたファイルを削除"""
-        indexes = self.list_view.selectedIndexes()
-        if not indexes:
-            return
-        
-        # 確認ダイアログ
-        reply = QMessageBox.question(
-            self, "削除確認", 
-            f"{len(indexes)}個のアイテムを削除しますか？\nこの操作は元に戻せません。",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
-        )
-        
-        if reply == QMessageBox.Yes:
+        paths = self._get_selected_paths()
+        if not paths: return
+        if silent_question(self, "削除確認", f"{len(paths)}個のアイテムを削除しますか？\n戻せません。", QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
             try:
-                for index in indexes:
-                    source_index = self.proxy_model.mapToSource(index)
-                    path = self.file_system_model.filePath(source_index)
-                    
-                    if os.path.isdir(path):
-                        import shutil
-                        shutil.rmtree(path)
-                    else:
-                        os.remove(path)
-                
+                for p in paths:
+                    if os.path.isdir(p): shutil.rmtree(p)
+                    else: os.remove(p)
+                self.clear_file_selection()
                 self.refresh()
             except Exception as e:
-                QMessageBox.warning(self, "エラー", f"削除できませんでした: {e}")
+                logger.error(f"Delete error: {e}")
+                silent_warning(self, "エラー", f"削除できませんでした: {e}")
     
     def navigate_up(self):
-        """上のフォルダに移動"""
-        parent_path = os.path.dirname(self.current_path)
-        if parent_path and parent_path != self.current_path:
-            self.set_current_path(parent_path)
+        p = os.path.dirname(self.current_path)
+        if p and p != self.current_path: self.set_current_path(p)
     
     def change_view_mode(self, mode):
-        """表示モードを変更"""
         try:
-            # QListViewかQTreeViewかを確認
-            if hasattr(self.list_view, 'setViewMode'):  # QListView
-                if mode == "リスト表示" or mode == 0:
-                    self.list_view.setViewMode(QListView.ListMode)
-                    self.list_view.setHeaderHidden(True)
-                    self.view_mode = "list"
-                elif mode == "アイコン表示" or mode == 1:
-                    self.list_view.setViewMode(QListView.IconMode)
-                    self.list_view.setHeaderHidden(True)
-                    self.view_mode = "icon"
-                else:  # 詳細表示 or mode == 2
-                    self.list_view.setViewMode(QListView.ListMode)
-                    self.list_view.setHeaderHidden(False)
-                    self.view_mode = "detail"
-                    self.setup_detail_view()
-            else:  # QTreeView
-                # QTreeViewの場合はヘッダーの表示/非表示のみ制御
-                if mode == "リスト表示" or mode == 0:
-                    self.list_view.setHeaderHidden(True)
-                    self.view_mode = "list"
-                elif mode == "アイコン表示" or mode == 1:
-                    self.list_view.setHeaderHidden(True)
-                    self.view_mode = "icon"
-                else:  # 詳細表示 or mode == 2
-                    self.list_view.setHeaderHidden(False)
-                    self.view_mode = "detail"
-                    self.setup_detail_view()
-                
-            # 表示モード設定を保存
+            if mode == "リスト表示": self.view_mode = "list"
+            elif mode == "アイコン表示": self.view_mode = "icon"
+            else: self.view_mode = "detail"
+
+            self.list_view.setHeaderHidden(self.view_mode != "detail")
+            if self.view_mode == "detail": self.setup_detail_view()
             self.settings.setValue("view_mode", self.view_mode)
-            print(f"表示モードを変更しました: {self.view_mode}")
         except Exception as e:
-            print(f"表示モード変更エラー: {e}")
+            logger.error(f"View mode change error: {e}")
     
     def change_sort_order(self, sort_type):
-        """ソート順を変更"""
-        if sort_type == "名前":
-            self.proxy_model.sort(0, Qt.AscendingOrder)
-        elif sort_type == "サイズ":
-            self.proxy_model.sort(1, Qt.AscendingOrder)
-        elif sort_type == "更新日":
-            self.proxy_model.sort(3, Qt.DescendingOrder)
-        elif sort_type == "種類":
-            self.proxy_model.sort(2, Qt.AscendingOrder)
+        m = {"名前": 0, "サイズ": 1, "更新日": 3, "種類": 2}
+        if sort_type in m:
+            self.proxy_model.sort(m[sort_type], Qt.AscendingOrder if sort_type != "更新日" else Qt.DescendingOrder)
     
     def filter_files(self, text):
-        """ファイルをフィルタリング"""
-        if text:
-            self.proxy_model.setFilterWildcard(f"*{text}*")
-        else:
-            self.proxy_model.setFilterWildcard("*")
-        
-        # フィルタリング後に現在のパスを再設定
-        self.set_current_path(self.current_path)
+        # set_filename_filter_text 内で invalidateFilter() が呼ばれるため追加のリロードは不要
+        self.proxy_model.set_filename_filter_text(text)
+
+    def toggle_foreign_filename_filter(self, checked):
+        # set_foreign_filename_only 内で invalidateFilter() が呼ばれるため追加のリロードは不要
+        # (フォルダの再読み込みは非同期のため、直後にフィルタ結果が上書きされる原因になる)
+        self.filter_foreign_filenames = bool(checked)
+        self.proxy_model.set_foreign_filename_only(checked)
 
     def toggle_hidden_files(self):
-        """隠しファイル表示の切替"""
         self.show_hidden = not self.show_hidden
         self.hidden_button.setChecked(self.show_hidden)
-
-        # 設定を保存
         self.settings.setValue("show_hidden", self.show_hidden)
-
-        # フィルター設定を更新（モデルの再設定は行わない）
         self.update_filter_only()
-
-        # 表示を更新
         self.refresh()
 
     def update_filter_only(self):
-        """フィルター設定のみを更新（モデルの再設定は行わない）"""
-        # 基本フィルター
-        base_filter = QDir.AllDirs | QDir.Files | QDir.NoDotAndDotDot
-        folder_filter = QDir.AllDirs | QDir.NoDotAndDotDot
-
-        # 隠しファイル表示が有効な場合はHiddenを追加
+        f = QDir.AllDirs | QDir.Files | QDir.NoDotAndDotDot
         if self.show_hidden:
-            base_filter |= QDir.Hidden
-            folder_filter |= QDir.Hidden
-
-        # 既存のモデルのフィルターを更新
-        self.file_system_model.setFilter(base_filter)
+            f |= QDir.Hidden | QDir.System
+        self.file_system_model.setFilter(f)
         if hasattr(self.left_pane, 'folder_model'):
+            folder_filter = QDir.AllDirs | QDir.NoDotAndDotDot
+            if self.show_hidden:
+                folder_filter |= QDir.Hidden | QDir.System
             self.left_pane.folder_model.setFilter(folder_filter)
 
     def setup_custom_delegate(self):
-        """カスタムデリゲートの設定"""
-        # 右ペイン（ファイル一覧）用のデリゲート
         self.file_delegate = FileItemDelegate(self)
         self.list_view.setItemDelegate(self.file_delegate)
-
-        # 左ペイン（フォルダツリー）用のデリゲート
         if hasattr(self.left_pane, 'tree_view'):
-            self.folder_delegate = FileItemDelegate(self)
-            self.left_pane.tree_view.setItemDelegate(self.folder_delegate)
+            self.left_pane.tree_view.setItemDelegate(FileItemDelegate(self))
     
     def setup_detail_view(self):
-        header = self.list_view.header()
-        header.setStretchLastSection(False)
-        
-        # 列の幅を設定
-        header.setSectionResizeMode(0, QHeaderView.Stretch)  # 名前
-        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)  # サイズ
-        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)  # 種類
-        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)  # 更新日時
-        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)  # 権限
-        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)  # 作成日時
-        header.setSectionResizeMode(6, QHeaderView.ResizeToContents)  # 属性
-        header.setSectionResizeMode(7, QHeaderView.ResizeToContents)  # 拡張子
-        header.setSectionResizeMode(8, QHeaderView.ResizeToContents)  # 所有者
-        header.setSectionResizeMode(9, QHeaderView.ResizeToContents)  # グループ
-        
-        # 列幅復元
+        h = self.list_view.header()
+        h.setStretchLastSection(False)
+        for i in range(h.count()): h.setSectionResizeMode(i, QHeaderView.Interactive)
+        for k, c in self.DETAIL_VIEW_COLUMNS: h.resizeSection(c, self.DEFAULT_COLUMN_WIDTHS.get(k, 100))
         self.restore_column_widths()
-        
-        # 列の表示/非表示を設定
+        self._restore_list_header_state()
         self.update_column_visibility()
-        
-        # 列幅変更時に保存
-        header.sectionResized.connect(self.save_column_widths)
+        h.sectionResized.connect(self.save_column_widths)
+        h.sectionMoved.connect(lambda *_: self._save_list_header_state())
+        h.sortIndicatorChanged.connect(lambda *_: self._save_list_header_state())
 
     def save_column_widths(self):
-        header = self.list_view.header()
-        widths = [header.sectionSize(i) for i in range(header.count())]
-        self.settings.setValue(self.COLUMN_WIDTHS_KEY, widths)
+        h = self.list_view.header()
+        self.settings.setValue(self.COLUMN_WIDTHS_KEY, [h.sectionSize(i) for i in range(h.count())])
+
+    def _save_list_header_state(self):
+        try: self.settings.setValue("list_header_state", self.list_view.header().saveState())
+        except Exception as e: logger.debug(f"Header state save error: {e}")
+
+    def _restore_list_header_state(self):
+        try:
+            s = self.settings.value("list_header_state")
+            if s: self.list_view.header().restoreState(s)
+        except Exception as e: logger.debug(f"Header state restore error: {e}")
+
+    def _save_splitter_state(self):
+        try: self.settings.setValue("splitter_sizes", [int(s) for s in self.splitter.sizes()])
+        except Exception as e: logger.debug(f"Splitter state save error: {e}")
+
+    def _restore_splitter_state(self):
+        try:
+            r = self.settings.value("splitter_sizes")
+            if r:
+                sizes = [int(v) for v in r]
+                if len(sizes) >= 2:
+                    total = max(sum(sizes), 900)
+                    left = max(sizes[0], 200)
+                    right = max(total - left, 400)
+                    self.splitter.setSizes([left, right])
+        except Exception as e: logger.debug(f"Splitter state restore error: {e}")
+
+    def save_window_state(self):
+        self._save_splitter_state()
+        self._save_list_header_state()
+        self.save_column_widths()
+        self.save_settings()
+        self.settings.sync()
 
     def restore_column_widths(self):
-        header = self.list_view.header()
-        widths = self.settings.value(self.COLUMN_WIDTHS_KEY)
-        if isinstance(widths, list) and len(widths) == header.count():
-            for i, w in enumerate(widths):
-                try:
-                    width_value = int(w)
-                except Exception:
-                    continue
-                try:
-                    header.resizeSection(i, width_value)
-                except Exception:
-                    continue
-        for key, column in self.DETAIL_VIEW_COLUMNS:
-            if not self.visible_columns.get(key, False) and key != 'name':
-                continue
-            self._ensure_column_width(column, key)
+        h = self.list_view.header()
+        ws = self.settings.value(self.COLUMN_WIDTHS_KEY)
+        if isinstance(ws, list) and len(ws) == h.count():
+            for i, w in enumerate(ws):
+                try: h.resizeSection(i, int(w))
+                except Exception: continue
+        for k, c in self.DETAIL_VIEW_COLUMNS:
+            if self.visible_columns.get(k, False) or k == 'name': self._ensure_column_width(c, k)
 
     def update_column_visibility(self):
-        """詳細表示の列表示状態を設定に合わせて更新"""
-        if not hasattr(self, 'list_view') or not hasattr(self, 'visible_columns'):
-            return
-
-        view = self.list_view
-        if not hasattr(view, 'setColumnHidden'):
-            return
-
-        for key, column in self.DETAIL_VIEW_COLUMNS:
-            should_show = self.visible_columns.get(key, False)
-            if key == 'name':
-                should_show = True
+        v = self.list_view
+        for k, c in self.DETAIL_VIEW_COLUMNS:
+            show = self.visible_columns.get(k, k == 'name')
             try:
-                view.setColumnHidden(column, not should_show)
-                if should_show:
-                    self._ensure_column_width(column, key)
-            except Exception:
-                continue
-
-        try:
-            view.viewport().update()
-        except Exception:
-            pass
+                v.setColumnHidden(c, not show)
+                if show: self._ensure_column_width(c, k)
+            except Exception: continue
+        v.viewport().update()
 
     def show_settings(self):
         try:
-            previous_path = getattr(self, 'current_path', '')
-            current_visible_columns = self.visible_columns.copy()
-            dialog = SettingsDialog(self, self.settings, current_visible_columns)
-            result = dialog.exec() if hasattr(dialog, 'exec') else dialog.exec_()
-            if result == QDialog.Accepted:
+            self.settings.sync()
+            self.load_settings()
+            old_p, old_cols = self.current_path, self.visible_columns.copy()
+            if SettingsDialog(self, self.settings, old_cols).exec() == QDialog.Accepted:
+                self.settings.sync()
                 self.load_settings()
-                if hasattr(self, 'view_mode_combo') and self.view_mode != "detail":
-                    self.view_mode_combo.setCurrentIndex(2)
-                    self.change_view_mode(2)
-                if hasattr(self, 'file_system_model') and hasattr(self.file_system_model, 'update_visible_columns'):
-                    self.file_system_model.update_visible_columns(self.visible_columns)
+                self.file_system_model.update_visible_columns(self.visible_columns)
                 self.update_column_visibility()
                 self.restore_column_widths()
-                self.list_view.repaint()
-                if previous_path and os.path.isdir(previous_path):
-                    self._restore_path(previous_path)
-                    QTimer.singleShot(0, lambda p=previous_path: self._restore_path(p))
-                else:
-                    QTimer.singleShot(0, self._restore_current_root_index)
+                self.rebuild_toolbar()
+                if old_p and os.path.isdir(old_p): self._restore_path(old_p)
         except Exception as e:
-            print(f"設定適用エラー: {e}")
+            logger.error(f"Settings apply error: {e}")
 
     def show_video_digest(self, video_path):
-        """動画ダイジェストを表示"""
-        if not VIDEO_DIGEST_AVAILABLE:
-            QMessageBox.warning(self, "エラー", "動画ダイジェスト機能が利用できません（モジュールが見つかりません）。")
-            return
-
-        if not OPENCV_AVAILABLE and not getattr(self, '_opencv_warning_shown', False):
-            self._opencv_warning_shown = True
-            QMessageBox.information(
-                self,
-                "情報",
-                "OpenCV がインストールされていないため、プレースホルダーのサムネイルを表示します。\n'pip install opencv-python' を実行すると実際のフレームを生成できます。"
-            )
-
-        try:
-            parent = self if isinstance(self, QWidget) else None
-            dialog = VideoDigestDialog(video_path, parent)
-            dialog.exec()
+        if not VIDEO_DIGEST_AVAILABLE: return
+        try: VideoDigestDialog(video_path, self).exec()
         except Exception as e:
-            QMessageBox.warning(self, "エラー", f"動画ダイジェストの表示中にエラーが発生しました: {str(e)}")
+            logger.error(f"Video digest error: {e}")
+            QMessageBox.warning(self, "エラー", f"動画ダイジェストの表示中にエラーが発生しました: {e}")
+
+    @staticmethod
+    def _create_settings():
+        from PySide6 import QtCore  # 遅延インポートでテストを容易にする
+        return QtCore.QSettings("FileManager", "Settings")
 
     def load_settings(self):
-        """設定を読み込み"""
+        s = self.settings
+
+        # 表示列 — 失敗しても他グループに影響しない
         try:
-            # 設定値を読み込み（デフォルト値は安全なフォールバックを使用）
             self.visible_columns = {
-                "name": True,  # 名前列は常に表示
-                "size": self._coerce_bool(self.settings.value("show_size", True), True),
-                "type": self._coerce_bool(self.settings.value("show_type", True), True),
-                "modified": self._coerce_bool(self.settings.value("show_modified", True), True),
-                "permissions": self._coerce_bool(self.settings.value("show_permissions", False), False),
-                "created": self._coerce_bool(self.settings.value("show_created", False), False),
-                "attributes": self._coerce_bool(self.settings.value("show_attributes", True), True),
-                "extension": self._coerce_bool(self.settings.value("show_extension", False), False),
-                "owner": self._coerce_bool(self.settings.value("show_owner", False), False),
-                "group": self._coerce_bool(self.settings.value("show_group", False), False),
-                "duration": self._coerce_bool(self.settings.value("show_duration", True), True),
-                "resolution": self._coerce_bool(self.settings.value("show_resolution", True), True),
-                "fps": self._coerce_bool(self.settings.value("show_fps", False), False),
+                "name": True,
+                "size": coerce_bool(s.value("show_size", True), True),
+                "type": coerce_bool(s.value("show_type", True), True),
+                "modified": coerce_bool(s.value("show_modified", True), True),
+                "permissions": coerce_bool(s.value("show_permissions", False), False),
+                "created": coerce_bool(s.value("show_created", False), False),
+                "attributes": coerce_bool(s.value("show_attributes", True), True),
+                "extension": coerce_bool(s.value("show_extension", False), False),
+                "owner": coerce_bool(s.value("show_owner", False), False),
+                "group": coerce_bool(s.value("show_group", False), False),
+                "duration": coerce_bool(s.value("show_duration", True), True),
+                "resolution": coerce_bool(s.value("show_resolution", True), True),
+                "fps": coerce_bool(s.value("show_fps", False), False),
             }
-
-            # 隠しファイル表示設定を読み込み
-            self.show_hidden = self._coerce_bool(self.settings.value("show_hidden", False), False)
-
-            # ファイル属性色設定を読み込み
-            self.attribute_colors = {
-                "hidden": self._coerce_color(self.settings.value("color_hidden", "#808080"), "#808080"),
-                "readonly": self._coerce_color(self.settings.value("color_readonly", "#0000FF"), "#0000FF"),
-                "system": self._coerce_color(self.settings.value("color_system", "#FF0000"), "#FF0000"),
-                "normal": self._coerce_color(self.settings.value("color_normal", "#000000"), "#000000"),
-            }
-            # 動画ダイジェスト関連の設定値
-            self.video_thumbnail_count = self._coerce_int(
-                self.settings.value("video_thumbnail_count", 6),
-                6, minimum=1, maximum=12,
-            )
-            thumb_width = self._coerce_int(
-                self.settings.value("video_thumbnail_width", 160),
-                160, minimum=80, maximum=400,
-            )
-            thumb_height = self._coerce_int(
-                self.settings.value("video_thumbnail_height", 90),
-                90, minimum=60, maximum=300,
-            )
-            self.video_thumbnail_size = (thumb_width, thumb_height)
-            self.video_auto_show_digest = self._coerce_bool(
-                self.settings.value("video_auto_show_digest", False),
-                False,
-            )
-
-            # 表示モード設定を読み込み
-            self.view_mode = self._coerce_str(self.settings.value("view_mode", "list"), "list")
-            if self.view_mode not in {"list", "icon", "detail"}:
-                self.view_mode = "list"
-            
-            if hasattr(self, 'file_system_model') and hasattr(self.file_system_model, 'update_visible_columns'):
-                self.file_system_model.update_visible_columns(self.visible_columns)
-            if hasattr(self, 'list_view'):
-                self.update_column_visibility()
-
-            if getattr(self, 'thumbnail_preview', None):
-                self.thumbnail_preview.set_preferences(
-                    max_thumbnails=self.video_thumbnail_count,
-                    thumbnail_size=self.video_thumbnail_size,
-                )
-
-            print(f"設定を読み込みました: visible_columns={self.visible_columns}")
         except Exception as e:
-            print(f"設定読み込みエラー: {e}")
-            # デフォルト設定にフォールバック
+            logger.error(f"Load visible_columns error: {e}")
             self.visible_columns = {
                 "name": True, "size": True, "type": True, "modified": True,
                 "permissions": False, "created": False, "attributes": True,
-                "extension": False, "owner": False, "group": False, 
-                "duration": True, "resolution": True, "fps": False
+                "extension": False, "owner": False, "group": False,
+                "duration": True, "resolution": True, "fps": False,
             }
+
+        try:
+            self.show_hidden = coerce_bool(s.value("show_hidden", True), True)
+        except Exception as e:
+            logger.error(f"Load show_hidden error: {e}")
             self.show_hidden = False
+
+        try:
             self.attribute_colors = {
-                "hidden": "#808080", "readonly": "#0000FF", 
-                "system": "#FF0000", "normal": "#000000"
+                "hidden": coerce_color(s.value("color_hidden", "#808080"), "#808080"),
+                "readonly": coerce_color(s.value("color_readonly", "#0000FF"), "#0000FF"),
+                "system": coerce_color(s.value("color_system", "#FF0000"), "#FF0000"),
+                "normal": coerce_color(s.value("color_normal", "#000000"), "#000000"),
             }
+        except Exception as e:
+            logger.error(f"Load attribute_colors error: {e}")
+            self.attribute_colors = {
+                "hidden": "#808080", "readonly": "#0000FF",
+                "system": "#FF0000", "normal": "#000000",
+            }
+
+        try:
+            self.video_thumbnail_count = coerce_int(s.value("video_thumbnail_count", 6), 6, minimum=1, maximum=12)
+            self.video_digest_max_frames = coerce_int(s.value("video_digest_max_frames", 12), 12, minimum=1, maximum=60)
+            tw = coerce_int(s.value("video_thumbnail_width", 160), 160, minimum=80, maximum=400)
+            th = coerce_int(s.value("video_thumbnail_height", 90), 90, minimum=60, maximum=300)
+            self.video_thumbnail_size = (tw, th)
+            old_auto = coerce_bool(s.value("video_auto_show_digest", False), False)
+            trigger_default = "left" if old_auto else "none"
+            self.video_digest_trigger = str(s.value("video_digest_trigger", trigger_default))
+            self.video_auto_show_digest = (self.video_digest_trigger == "left")
+            self.video_hover_thumbnail_enabled = coerce_bool(s.value("video_hover_thumbnail_enabled", False), False)
+            self.video_digest_cache_size_mb = coerce_int(s.value("video_digest_cache_size_mb", 200), 200, minimum=1, maximum=2048)
+            self.video_digest_burst_count = coerce_int(s.value("video_digest_burst_count", 0), 0, minimum=0, maximum=3)
+            self.video_player_enabled = coerce_bool(s.value("video_player_enabled", True), True)
+            self.video_player_default_muted = coerce_bool(s.value("video_player_default_muted", True), True)
+            self.video_player_autoplay = coerce_bool(s.value("video_player_autoplay", True), True)
+            speed_value = s.value("video_player_default_speed", 1.0)
+            try:
+                self.video_player_default_speed = float(speed_value)
+            except (TypeError, ValueError):
+                self.video_player_default_speed = 1.0
+            if self.video_player_default_speed not in (1.0, 1.5, 2.0):
+                self.video_player_default_speed = 1.0
+        except Exception as e:
+            logger.error(f"Load video settings error: {e}")
+            self.video_thumbnail_count = 6
+            self.video_digest_max_frames = 12
+            self.video_thumbnail_size = (160, 90)
+            self.video_digest_trigger = "none"
+            self.video_auto_show_digest = False
+            self.video_hover_thumbnail_enabled = False
+            self.video_digest_cache_size_mb = 200
+            self.video_digest_burst_count = 0
+            self.video_player_enabled = True
+            self.video_player_default_speed = 1.0
+            self.video_player_default_muted = True
+            self.video_player_autoplay = True
+
+        try:
+            self.view_mode = coerce_str(s.value("view_mode", "list"), "list")
+        except Exception as e:
+            logger.error(f"Load view_mode error: {e}")
             self.view_mode = "list"
-    
-    def save_settings(self):
-        """設定を保存"""
+
+        # UI への反映
         try:
-            column_defaults = {
-                "name": True,
-                "size": True,
-                "type": True,
-                "modified": True,
-                "permissions": False,
-                "created": False,
-                "attributes": True,
-                "extension": False,
-                "owner": False,
-                "group": False,
-                "duration": True,
-                "resolution": True,
-                "fps": False,
-            }
-            for key, default in column_defaults.items():
-                value = self.visible_columns.get(key, default)
-                self.settings.setValue(f"show_{key}", value)
-
-            self.settings.setValue("view_mode", getattr(self, 'view_mode', 'list'))
-            self.settings.setValue("show_hidden", getattr(self, 'show_hidden', False))
-
-            if hasattr(self, 'attribute_colors'):
-                for color_key, color_value in self.attribute_colors.items():
-                    self.settings.setValue(f"color_{color_key}", color_value)
-
-            self.settings.sync()
-        except Exception as error:
-            print(f"設定保存エラー: {error}")
-    def show_column_menu(self, position):
-        """ヘッダーの右クリックメニューを表示"""
-        menu = QMenu(self)
-        menu.setTitle("表示する項目")
-        
-        # 列の定義（表示名、設定キー、列インデックス）
-        # 設定ダイアログと同じ項目構成に統一
-        columns = [
-            ("ファイル名", "name", 0, False),  # 常に表示
-            ("サイズ", "size", 1, True),
-            ("種類", "type", 2, True),
-            ("更新日時", "modified", 3, True),
-            ("権限", "permissions", 4, True),
-            ("作成日時", "created", 5, True),
-            ("属性", "attributes", 6, True),
-            ("拡張子", "extension", 7, True),
-            ("所有者", "owner", 8, True),
-            ("グループ", "group", 9, True),
-            ("再生時間", "duration", 10, True),
-            ("解像度", "resolution", 11, True),
-            ("FPS", "fps", 12, True),
-        ]
-        
-        # 各列のチェックボックスアクションを作成
-        for display_name, key, column_index, can_hide in columns:
-            if key in self.visible_columns:
-                action = QAction(display_name, self)
-                action.setCheckable(True)
-                action.setChecked(self.visible_columns[key])
-                action.setEnabled(can_hide)  # ファイル名は常に表示
-                
-                # アクションに列情報を保存
-                action.setData({"key": key, "column_index": column_index})
-                action.triggered.connect(lambda checked, a=action: self.toggle_column(a))
-                menu.addAction(action)
-        
-        menu.exec(self.list_view.header().mapToGlobal(position))
-    
-    def toggle_column(self, action):
-        """列の表示/非表示を切り替え"""
-        try:
-            data = action.data()
-            key = data["key"]
-            column_index = data["column_index"]
-            
-            # 設定を更新
-            self.visible_columns[key] = action.isChecked()
-            
-            # 設定を保存
-            self.settings.setValue(f"show_{key}", action.isChecked())
-            
-            # カスタムモデルの表示列設定を更新
-            if hasattr(self, 'file_system_model') and hasattr(self.file_system_model, 'update_visible_columns'):
+            if hasattr(self, 'hidden_button'):
+                self.hidden_button.setChecked(self.show_hidden)
+            if hasattr(self, 'file_system_model'):
+                self.update_filter_only()
                 self.file_system_model.update_visible_columns(self.visible_columns)
-            
-            # 詳細表示の場合は列の表示を更新
-            if self.view_mode == "detail":
+            if hasattr(self, 'list_view'):
                 self.update_column_visibility()
-                
-            print(f"列表示を切り替えました: {key}={action.isChecked()}")
         except Exception as e:
-            print(f"列切り替えエラー: {e}")
-
-class SettingsDialog(QDialog):
-    """設定ダイアログ"""
-    
-    def __init__(self, parent, settings, visible_columns):
-        # QDialog.__init__ expects a QWidget (or None). Tests may pass a
-        # non-QWidget "parent" (a helper object that simulates the parent
-        # behaviour but isn't a QWidget). In that case pass None to the
-        # QDialog base constructor but keep the original object as the
-        # logical parent for later updates.
-        real_parent = parent if isinstance(parent, QWidget) else None
-        super().__init__(real_parent)
-        # store the logical parent (could be a non-widget used in tests)
-        self._logical_parent = parent
-        self.settings = settings or QSettings("FileManager", "Settings")
-        self.visible_columns = visible_columns.copy()
-        # ensure all expected column keys exist with sensible defaults
-        defaults = {
-            "name": True,
-            "size": True,
-            "type": True,
-            "modified": True,
-            "permissions": True,
-            "created": True,
-            "attributes": True,
-            "extension": True,
-            "owner": True,
-            "group": True,
-        }
-        for k, v in defaults.items():
-            self.visible_columns.setdefault(k, v)
-        # デフォルトの色設定を初期化
-        self.current_colors = {
-            "hidden": "#808080",
-            "readonly": "#0000FF",
-            "system": "#FF0000",
-            "normal": "#000000"
-        }
-        self.init_ui()
-        self.load_current_settings()
-    
-    def init_ui(self):
-        """UIの初期化"""
-        self.setWindowTitle("設定")
-        self.setModal(True)
-        self.resize(400, 300)
-        
-        layout = QVBoxLayout(self)
-        
-        # タブウィジェット
-        tab_widget = QTabWidget()
-        layout.addWidget(tab_widget)
-        
-        # フォント設定タブ
-        font_tab = QWidget()
-        font_layout = QFormLayout(font_tab)
-        
-        # 左ペインフォント
-        font_group = QGroupBox("左ペイン（フォルダツリー）")
-        font_group_layout = QFormLayout(font_group)
-        
-        self.tree_font_combo = QFontComboBox()
-        self.tree_font_size = QSpinBox()
-        self.tree_font_size.setRange(8, 24)
-        self.tree_font_size.setValue(10)
-        
-        font_group_layout.addRow("フォント:", self.tree_font_combo)
-        font_group_layout.addRow("サイズ:", self.tree_font_size)
-        font_layout.addWidget(font_group)
-        
-        # 右ペインフォント
-        list_font_group = QGroupBox("右ペイン（ファイル一覧）")
-        list_font_group_layout = QFormLayout(list_font_group)
-        
-        self.list_font_combo = QFontComboBox()
-        self.list_font_size = QSpinBox()
-        self.list_font_size.setRange(8, 24)
-        self.list_font_size.setValue(10)
-        
-        list_font_group_layout.addRow("フォント:", self.list_font_combo)
-        list_font_group_layout.addRow("サイズ:", self.list_font_size)
-        font_layout.addWidget(list_font_group)
-        
-        tab_widget.addTab(font_tab, "フォント")
-        
-        # 表示設定タブ
-        display_tab = QWidget()
-        display_layout = QFormLayout(display_tab)
-        
-        # 詳細表示の列設定
-        column_group = QGroupBox("詳細表示で表示する項目")
-        column_layout = QFormLayout(column_group)
-        
-        self.name_checkbox = QCheckBox("ファイル名")
-        self.name_checkbox.setChecked(True)
-        self.name_checkbox.setEnabled(False)  # ファイル名は常に表示
-        
-        self.size_checkbox = QCheckBox("サイズ")
-        self.size_checkbox.setChecked(self.visible_columns["size"])
-        
-        self.type_checkbox = QCheckBox("種類")
-        self.type_checkbox.setChecked(self.visible_columns["type"])
-        
-        self.modified_checkbox = QCheckBox("更新日時")
-        self.modified_checkbox.setChecked(self.visible_columns["modified"])
-        
-        self.permissions_checkbox = QCheckBox("権限")
-        self.permissions_checkbox.setChecked(self.visible_columns["permissions"])
-        
-        self.created_checkbox = QCheckBox("作成日時")
-        self.created_checkbox.setChecked(self.visible_columns["created"])
-        
-        self.attributes_checkbox = QCheckBox("属性")
-        self.attributes_checkbox.setChecked(self.visible_columns["attributes"])
-        
-        self.extension_checkbox = QCheckBox("拡張子")
-        self.extension_checkbox.setChecked(self.visible_columns["extension"])
-        
-        self.owner_checkbox = QCheckBox("所有者")
-        self.owner_checkbox.setChecked(self.visible_columns["owner"])
-        
-        self.group_checkbox = QCheckBox("グループ")
-        self.group_checkbox.setChecked(self.visible_columns["group"])
-        
-        column_layout.addRow(self.name_checkbox)
-        column_layout.addRow(self.size_checkbox)
-        column_layout.addRow(self.type_checkbox)
-        column_layout.addRow(self.modified_checkbox)
-        column_layout.addRow(self.permissions_checkbox)
-        column_layout.addRow(self.created_checkbox)
-        column_layout.addRow(self.attributes_checkbox)
-        column_layout.addRow(self.extension_checkbox)
-        column_layout.addRow(self.owner_checkbox)
-        column_layout.addRow(self.group_checkbox)
-        
-        display_layout.addWidget(column_group)
-        
-        tab_widget.addTab(display_tab, "表示")
-
-        # 色設定タブ
-        color_tab = QWidget()
-        color_layout = QFormLayout(color_tab)
-
-        color_group = QGroupBox("ファイル属性の色設定")
-        color_group_layout = QFormLayout(color_group)
-
-        # 隠しファイル色設定
-        self.hidden_color_button = QPushButton()
-        self.hidden_color_button.setFixedSize(50, 25)
-        self.hidden_color_button.clicked.connect(lambda: self.choose_color('hidden'))
-
-        # 読み込み専用ファイル色設定
-        self.readonly_color_button = QPushButton()
-        self.readonly_color_button.setFixedSize(50, 25)
-        self.readonly_color_button.clicked.connect(lambda: self.choose_color('readonly'))
-
-        # システムファイル色設定
-        self.system_color_button = QPushButton()
-        self.system_color_button.setFixedSize(50, 25)
-        self.system_color_button.clicked.connect(lambda: self.choose_color('system'))
-
-        # 通常ファイル色設定
-        self.normal_color_button = QPushButton()
-        self.normal_color_button.setFixedSize(50, 25)
-        self.normal_color_button.clicked.connect(lambda: self.choose_color('normal'))
-
-        color_group_layout.addRow("隠しファイル:", self.hidden_color_button)
-        color_group_layout.addRow("読み込み専用:", self.readonly_color_button)
-        color_group_layout.addRow("システムファイル:", self.system_color_button)
-        color_group_layout.addRow("通常ファイル:", self.normal_color_button)
-
-        color_layout.addWidget(color_group)
-        tab_widget.addTab(color_tab, "色設定")
-
-                # 動画ダイジェスト設定タブ
-        video_tab = QWidget()
-        video_layout = QFormLayout(video_tab)
-
-        video_group = QGroupBox("動画ダイジェスト設定")
-        video_group_layout = QFormLayout(video_group)
-
-        # OpenCV の導入状況を案内
-        if not VIDEO_DIGEST_AVAILABLE:
-            warning_label = QLabel("⚠️ 動画ダイジェスト機能が利用できません。必要なモジュールが読み込めませんでした。")
-            warning_label.setStyleSheet("color: red; font-weight: bold;")
-            warning_label.setWordWrap(True)
-            video_group_layout.addRow(warning_label)
-        elif not OPENCV_AVAILABLE:
-            info_label = QLabel("ℹ️ OpenCV がインストールされていないため、プレースホルダーのサムネイルを表示します。\n'pip install opencv-python' を実行すると実際のフレームを生成できます。")
-            info_label.setStyleSheet("color: #b36b00;")
-            info_label.setWordWrap(True)
-            video_group_layout.addRow(info_label)
-
-# サムネイル数の設定
-        self.thumbnail_count_spin = QSpinBox()
-        self.thumbnail_count_spin.setRange(1, 12)
-        self.thumbnail_count_spin.setValue(6)
-        self.thumbnail_count_spin.setToolTip("生成するサムネイルの数（1-12）")
-        self.thumbnail_count_spin.setEnabled(VIDEO_DIGEST_AVAILABLE)
-        video_group_layout.addRow("サムネイル数:", self.thumbnail_count_spin)
-
-        # サムネイルサイズの設定
-        size_layout = QHBoxLayout()
-        self.thumbnail_width_spin = QSpinBox()
-        self.thumbnail_width_spin.setRange(80, 400)
-        self.thumbnail_width_spin.setValue(160)
-        self.thumbnail_width_spin.setSuffix(" px")
-        self.thumbnail_width_spin.setToolTip("サムネイルの幅")
-        self.thumbnail_width_spin.setEnabled(VIDEO_DIGEST_AVAILABLE)
-        
-        self.thumbnail_height_spin = QSpinBox()
-        self.thumbnail_height_spin.setRange(60, 300)
-        self.thumbnail_height_spin.setValue(90)
-        self.thumbnail_height_spin.setSuffix(" px")
-        self.thumbnail_height_spin.setToolTip("サムネイルの高さ")
-        self.thumbnail_height_spin.setEnabled(VIDEO_DIGEST_AVAILABLE)
-        
-        size_layout.addWidget(QLabel("幅:"))
-        size_layout.addWidget(self.thumbnail_width_spin)
-        size_layout.addWidget(QLabel("高さ:"))
-        size_layout.addWidget(self.thumbnail_height_spin)
-        size_layout.addStretch()
-        
-        video_group_layout.addRow("サムネイルサイズ:", size_layout)
-
-        # 自動表示の設定
-        self.auto_show_digest_checkbox = QCheckBox("動画ファイル選択時に自動でダイジェストを表示")
-        self.auto_show_digest_checkbox.setToolTip("動画ファイルを選択した際に自動的にダイジェストポップアップを表示するかどうか")
-        self.auto_show_digest_checkbox.setEnabled(VIDEO_DIGEST_AVAILABLE)
-        video_group_layout.addRow(self.auto_show_digest_checkbox)
-
-        video_layout.addWidget(video_group)
-        tab_widget.addTab(video_tab, "動画ダイジェスト")
-
-        # ボタン
-        button_layout = QHBoxLayout()
-        
-        self.ok_button = QPushButton("保存")
-        self.ok_button.setDefault(True)
-        self.ok_button.clicked.connect(self.accept)
-        
-        self.cancel_button = QPushButton("キャンセル")
-        self.cancel_button.clicked.connect(self.reject)
-        
-        button_layout.addWidget(self.ok_button)
-        button_layout.addWidget(self.cancel_button)
-        layout.addLayout(button_layout)
-    
-    def load_current_settings(self):
-        """現在の設定を読み込み"""
-        # フォント設定
-        tree_font_family = self.settings.value("tree_font_family", "Arial")
-        tree_font_size = self.settings.value("tree_font_size", 10, type=int)
-        
-        self.tree_font_combo.setCurrentFont(QFont(tree_font_family))
-        self.tree_font_size.setValue(tree_font_size)
-        
-        list_font_family = self.settings.value("list_font_family", "Arial")
-        list_font_size = self.settings.value("list_font_size", 10, type=int)
-        
-        self.list_font_combo.setCurrentFont(QFont(list_font_family))
-        self.list_font_size.setValue(list_font_size)
-        
-        # 親ウィジェットから最新の表示列設定を取得
-        parent = self.parent()
-        if parent and hasattr(parent, 'visible_columns'):
-            self.visible_columns = parent.visible_columns.copy()
-        
-        # 表示列設定
-        self.size_checkbox.setChecked(self.visible_columns.get("size", True))
-        self.type_checkbox.setChecked(self.visible_columns.get("type", True))
-        self.modified_checkbox.setChecked(self.visible_columns.get("modified", True))
-        self.permissions_checkbox.setChecked(self.visible_columns.get("permissions", False))
-        self.created_checkbox.setChecked(self.visible_columns.get("created", False))
-        self.attributes_checkbox.setChecked(self.visible_columns.get("attributes", False))
-        self.extension_checkbox.setChecked(self.visible_columns.get("extension", False))
-        self.owner_checkbox.setChecked(self.visible_columns.get("owner", False))
-        self.group_checkbox.setChecked(self.visible_columns.get("group", False))
-
-        # 動画ダイジェスト設定を読み込み
-        self.thumbnail_count_spin.setValue(self.settings.value("video_thumbnail_count", 6, type=int))
-        self.thumbnail_width_spin.setValue(self.settings.value("video_thumbnail_width", 160, type=int))
-        self.thumbnail_height_spin.setValue(self.settings.value("video_thumbnail_height", 90, type=int))
-        self.auto_show_digest_checkbox.setChecked(self.settings.value("video_auto_show_digest", False, type=bool))
-
-        # 色設定を読み込み
-        parent = self.parent()
-        if parent and hasattr(parent, 'attribute_colors'):
-            self.current_colors = parent.attribute_colors.copy()
-            self.update_color_buttons()
-        else:
-            # デフォルトの色設定を初期化
-            self.current_colors = {
-                "hidden": "#808080",
-                "readonly": "#0000FF",
-                "system": "#FF0000",
-                "normal": "#000000"
-            }
-            if hasattr(self, 'update_color_buttons'):
-                self.update_color_buttons()
-
-    def update_color_buttons(self):
-        """色ボタンの表示を更新"""
-        if hasattr(self, 'current_colors'):
-            if hasattr(self, 'hidden_color_button'):
-                self.hidden_color_button.setStyleSheet(f"background-color: {self.current_colors['hidden']}")
-            if hasattr(self, 'readonly_color_button'):
-                self.readonly_color_button.setStyleSheet(f"background-color: {self.current_colors['readonly']}")
-            if hasattr(self, 'system_color_button'):
-                self.system_color_button.setStyleSheet(f"background-color: {self.current_colors['system']}")
-            if hasattr(self, 'normal_color_button'):
-                self.normal_color_button.setStyleSheet(f"background-color: {self.current_colors['normal']}")
-
-    def choose_color(self, attribute_type):
-        """色選択ダイアログを表示"""
-        if hasattr(self, 'current_colors') and attribute_type in self.current_colors:
-            current_color = QColor(self.current_colors[attribute_type])
-            color = QColorDialog.getColor(current_color, self, f"{attribute_type}ファイルの色を選択")
-
-            if color.isValid():
-                self.current_colors[attribute_type] = color.name()
-                self.update_color_buttons()
-    
-    def _show_async_message(self, message_fn, title, text):
-        """QMessageBox をダイアログ完了後に安全に表示するヘルパー"""
-        def _show():
-            try:
-                # Use None as parent to avoid passing a possibly deleted
-                # widget (self) to the message box. Some Qt native code
-                # may crash if given a deleted parent object.
-                if callable(message_fn):
-                    try:
-                        message_fn(None, title, text)
-                    except TypeError:
-                        # Some message functions may expect different
-                        # signatures; fall back to a generic call.
-                        try:
-                            message_fn(title, text)
-                        except Exception:
-                            pass
-            except Exception:
-                # Catch all to avoid propagating errors from message display
-                # which may occur after the dialog is closed.
-                pass
-        QTimer.singleShot(0, _show)
-
-    def _show_save_success_message(self):
-        """設定保存完了を利用者に通知"""
-        self._show_async_message(QMessageBox.information, "設定", "設定を保存しました。")
-
-    def _handle_accept_error(self, error):
-        """設定保存時のエラーハンドリング"""
-        message = str(error) or "詳細不明のエラー"
-        print(f"設定保存エラー: {error}")
-        self._show_async_message(QMessageBox.critical, "エラー", f"設定の保存中にエラーが発生しました。\n{message}")
-
-    def _persist_settings(self):
-        """フォームで指定された設定内容を保存"""
-        # フォント設定を保存
-        tree_font = self.tree_font_combo.currentFont()
-        self.settings.setValue("tree_font_family", tree_font.family())
-        self.settings.setValue("tree_font_size", self.tree_font_size.value())
-
-        list_font = self.list_font_combo.currentFont()
-        self.settings.setValue("list_font_family", list_font.family())
-        self.settings.setValue("list_font_size", self.list_font_size.value())
-
-        # 表示列設定を保存 (ダイアログ上の状態を優先)
-        # 既存の設定をベースにする（durationなどの追加列が消えないように）
-        updated_columns = self.visible_columns.copy()
-        
-        # ダイアログで設定可能な項目を上書き
-        updated_columns.update({
-            "name": True,
-            "size": self.size_checkbox.isChecked(),
-            "type": self.type_checkbox.isChecked(),
-            "modified": self.modified_checkbox.isChecked(),
-            "permissions": self.permissions_checkbox.isChecked(),
-            "created": self.created_checkbox.isChecked(),
-            "attributes": self.attributes_checkbox.isChecked(),
-            "extension": self.extension_checkbox.isChecked(),
-            "owner": self.owner_checkbox.isChecked(),
-            "group": self.group_checkbox.isChecked(),
-        })
-        self.visible_columns = updated_columns.copy()
-        for key, value in updated_columns.items():
-            self.settings.setValue(f"show_{key}", value)
-
-        # 設定を即時反映
-        self.settings.sync()
-        print("QSettingsに表示設定を保存しました")
-
-        # 親ウィジェットに最新設定を適用 (失敗しても継続)
-        parent = getattr(self, '_logical_parent', None) or self.parent()
-        if parent:
-            try:
-                if hasattr(parent, 'visible_columns'):
-                    parent.visible_columns = updated_columns.copy()
-                    print(f"子ウィジェットのvisible_columnsを更新: {parent.visible_columns}")
-
-                try:
-                    if hasattr(parent, 'file_system_model') and hasattr(parent.file_system_model, 'update_visible_columns'):
-                        QTimer.singleShot(0, lambda p=parent: p.file_system_model.update_visible_columns(p.visible_columns))
-                        print("ファイルシステムモデルの更新をイベントループにスケジュールしました")
-                except Exception:
-                    print("ファイルシステムモデルの更新スケジューリングに失敗しました")
-
-                if hasattr(parent, 'view_mode') and parent.view_mode == "detail":
-                    try:
-                        if hasattr(parent, 'update_column_visibility'):
-                            QTimer.singleShot(0, lambda p=parent: p.update_column_visibility())
-                            print("列表示の更新をイベントループにスケジュールしました")
-                    except Exception:
-                        print("列表示の更新スケジューリングに失敗しました")
-            except Exception as error:
-                print(f"子ウィジェットへの設定反映でエラーが発生しました: {error}")
-
-        # 動画ダイジェスト設定を保存
-        self.settings.setValue("video_thumbnail_count", self.thumbnail_count_spin.value())
-        self.settings.setValue("video_thumbnail_width", self.thumbnail_width_spin.value())
-        self.settings.setValue("video_thumbnail_height", self.thumbnail_height_spin.value())
-        self.settings.setValue("video_auto_show_digest", self.auto_show_digest_checkbox.isChecked())
-
-        # 属性カラー設定を保存
-        parent = getattr(self, '_logical_parent', None) or self.parent()
-        if parent and hasattr(self, 'current_colors'):
-            parent.attribute_colors = self.current_colors.copy()
-            self.settings.setValue("color_hidden", self.current_colors["hidden"])
-            self.settings.setValue("color_readonly", self.current_colors["readonly"])
-            self.settings.setValue("color_system", self.current_colors["system"])
-            self.settings.setValue("color_normal", self.current_colors["normal"])
-        elif parent:
-            default_colors = {
-                "hidden": "#808080",
-                "readonly": "#0000FF",
-                "system": "#FF0000",
-                "normal": "#000000",
-            }
-            parent.attribute_colors = default_colors.copy()
-            self.settings.setValue("color_hidden", default_colors["hidden"])
-            self.settings.setValue("color_readonly", default_colors["readonly"])
-            self.settings.setValue("color_system", default_colors["system"])
-            self.settings.setValue("color_normal", default_colors["normal"])
-
-    def accept(self):
-        """保存ボタンが押された際の処理"""
-        try:
-            self._persist_settings()
-        except Exception as error:
-            self._handle_accept_error(error)
-            return
-        # Save-success message and closing the dialog are non-critical
-        # operations: protect them so that even if message display or
-        # widget closing fails, the app does not crash.
-        try:
-            self._show_save_success_message()
-        except Exception as e:
-            print(f"_show_save_success_message failed: {e}")
+            logger.error(f"Apply column settings error: {e}")
 
         try:
-            super().accept()
+            if self.thumbnail_preview:
+                self.thumbnail_preview.set_preferences(
+                    max_thumbnails=self.video_thumbnail_count,
+                    thumbnail_size=self.video_thumbnail_size,
+                    cache_size_mb=self.video_digest_cache_size_mb,
+                )
+            if hasattr(self, 'bento_grid'):
+                self.bento_grid.setVisible(self.video_hover_thumbnail_enabled)
         except Exception as e:
-            # As a fallback, attempt to close the dialog without
-            # raising further exceptions.
-            print(f"super().accept() raised an exception: {e}")
-            try:
-                self.close()
-            except Exception:
-                pass
+            logger.error(f"Apply thumbnail settings error: {e}")
 
-    def _handle_metadata_fetch_request(self, path):
-        """モデルからのメタデータ取得リクエストを処理"""
-        from PySide6.QtCore import QRunnable
+        self.apply_fonts()
 
-        class FetchTask(QRunnable):
-            def __init__(self, worker, path):
-                super().__init__()
-                self.worker = worker
-                self.path = path
-            
-            def run(self):
-                self.worker.fetch_metadata(self.path)
+    def save_settings(self):
+        try:
+            s = self.settings
+            for k, v in self.visible_columns.items():
+                s.setValue(f"show_{k}", v)
+            s.setValue("view_mode", self.view_mode)
+            s.setValue("show_hidden", self.show_hidden)
+            for k, v in self.attribute_colors.items():
+                s.setValue(f"color_{k}", v)
+            s.setValue("video_digest_trigger", getattr(self, 'video_digest_trigger', 'none'))
+            s.setValue("video_auto_show_digest", getattr(self, 'video_auto_show_digest', False))
+            s.setValue("video_thumbnail_count", getattr(self, 'video_thumbnail_count', 6))
+            s.setValue("video_digest_max_frames", getattr(self, 'video_digest_max_frames', 12))
+            if hasattr(self, 'video_thumbnail_size'):
+                s.setValue("video_thumbnail_width", self.video_thumbnail_size[0])
+                s.setValue("video_thumbnail_height", self.video_thumbnail_size[1])
+            s.setValue("video_hover_thumbnail_enabled", getattr(self, 'video_hover_thumbnail_enabled', True))
+            s.setValue("video_digest_cache_size_mb", getattr(self, 'video_digest_cache_size_mb', 200))
+            s.setValue("video_digest_burst_count", getattr(self, 'video_digest_burst_count', 0))
+            s.setValue("video_player_enabled", getattr(self, 'video_player_enabled', True))
+            s.setValue("video_player_default_speed", getattr(self, 'video_player_default_speed', 1.0))
+            s.setValue("video_player_default_muted", getattr(self, 'video_player_default_muted', True))
+            s.setValue("video_player_autoplay", getattr(self, 'video_player_autoplay', True))
+            s.sync()
+        except Exception as e:
+            logger.error(f"Save settings error: {e}")
 
-        task = FetchTask(self.metadata_worker, path)
-        self.thread_pool.start(task)
+    def show_column_menu(self, position):
+        menu = QMenu(self)
+        cols = [("ファイル名", "name", 0, False), ("サイズ", "size", 1, True), ("種類", "type", 2, True), ("更新日時", "modified", 3, True), ("権限", "permissions", 4, True), ("作成日時", "created", 5, True), ("属性", "attributes", 6, True), ("拡張子", "extension", 7, True), ("所有者", "owner", 8, True), ("グループ", "group", 9, True), ("再生時間", "duration", 10, True), ("解像度", "resolution", 11, True), ("FPS", "fps", 12, True)]
+        for name, key, idx, hideable in cols:
+            a = QAction(name, self)
+            a.setCheckable(True)
+            a.setChecked(self.visible_columns.get(key, False))
+            a.setEnabled(hideable)
+            a.setData({"key": key, "column_index": idx})
+            a.triggered.connect(lambda checked, act=a: self.toggle_column(act))
+            menu.addAction(a)
+        menu.exec(self.list_view.header().mapToGlobal(position))
 
-    def _on_metadata_ready(self, path, info):
-        """メタデータ取得完了時の処理"""
-        # 現在のビューのモデルを取得して更新
-        if hasattr(self, 'list_view') and self.view_mode == "detail":
-             model = self.list_view.model()
-             # プロキシモデルの可能性があるため、ソースモデルまで辿る
-             while hasattr(model, 'sourceModel'):
-                 model = model.sourceModel()
-             
-             if isinstance(model, CustomFileSystemModel):
-                 model.update_metadata(path, info)
+    def toggle_column(self, action):
+        key = action.data()["key"]
+        self.visible_columns[key] = action.isChecked()
+        self.settings.setValue(f"show_{key}", action.isChecked())
+        if hasattr(self, 'file_system_model'): self.file_system_model.update_visible_columns(self.visible_columns)
+        self.update_column_visibility()
 
-class FileItemDelegate(QStyledItemDelegate):
-    """ファイル属性に基づいてアイテムの表示を変更するカスタムデリゲート"""
-
-    def __init__(self, file_manager, parent=None):
-        super().__init__(parent)
-        self.file_manager = file_manager
-
-    def paint(self, painter, option, index):
-        """アイテムの描画"""
-        option_copy = QStyleOptionViewItem(option)
-        self.initStyleOption(option_copy, index)
-
-        color_override = None
-        if hasattr(self.file_manager, 'file_system_model') and hasattr(self.file_manager, 'folder_model'):
-            model = index.model()
-            file_path = None
-
-            if hasattr(model, 'mapToSource'):
-                source_index = model.mapToSource(index)
-                file_path = self.file_manager.file_system_model.filePath(source_index)
-            elif model == self.file_manager.folder_model:
-                file_path = self.file_manager.folder_model.filePath(index)
-            elif model == self.file_manager.file_system_model:
-                file_path = self.file_manager.file_system_model.filePath(index)
-
-            if file_path:
-                file_info = QFileInfo(file_path)
-                if file_info.exists():
-                    color_override = self.get_file_color(file_info)
-
-        if color_override is not None:
-            normal_color = QColor(self.file_manager.attribute_colors["normal"])
-            candidate_color = QColor(color_override)
-            if candidate_color != normal_color and not (option_copy.state & QStyle.State_Selected):
-                for group in (QPalette.Active, QPalette.Inactive, QPalette.Disabled):
-                    option_copy.palette.setColor(group, QPalette.Text, candidate_color)
-
-        super().paint(painter, option_copy, index)
-
-    def get_file_color(self, file_info):
-        """ファイル属性に基づいて色を決定"""
-        # 隠しファイルかチェック（Unixライクシステムでは.で始まるファイル）
-        if file_info.fileName().startswith('.') and file_info.fileName() not in ['.', '..']:
-            return self.file_manager.attribute_colors["hidden"]
-
-        # Windowsの場合の隠しファイル属性チェック
-        if sys.platform == "win32":
-            import stat
-            try:
-                file_stat = os.stat(file_info.filePath())
-                if file_stat.st_file_attributes & stat.FILE_ATTRIBUTE_HIDDEN:
-                    return self.file_manager.attribute_colors["hidden"]
-                if file_stat.st_file_attributes & stat.FILE_ATTRIBUTE_SYSTEM:
-                    return self.file_manager.attribute_colors["system"]
-            except (AttributeError, OSError):
-                pass
-
-        # 読み込み専用ファイルかチェック
-        if not file_info.isWritable() and file_info.isReadable():
-            return self.file_manager.attribute_colors["readonly"]
-
-        # デフォルト色
-        return self.file_manager.attribute_colors["normal"]
-
-# モジュールとして使用する場合のテスト用
 if __name__ == "__main__":
-    import sys
-    from PySide6.QtWidgets import QApplication
-    
     app = QApplication(sys.argv)
-    widget = FileManagerWidget()
-    widget.show()
+    w = FileManagerWidget()
+    w.show()
     sys.exit(app.exec())
-

@@ -1,13 +1,23 @@
 PySide6>=6.5.0
 PyInstaller>=5.13.0
+qtawesome>=1.3
 
 # 動画ダイジェスト機能用
 opencv-python>=4.8.0
 numpy>=1.24.0
 
-# ゴミ箱機能用（オプショナル）
-# ゴミ箱機能を使用する場合は以下のコマンドを実行してください:
-# Windows: pip install winshell
-# macOS/Linux: pip install send2trash
-# winshell>=1.0.228
-# send2trash>=1.8.2
+# ゴミ箱機能用
+send2trash>=1.8.2
+
+# 動画クラスタリング機能用（オプション）
+# 以下は任意インストール — インストールなしでもカラーヒストグラムで動作する
+# open_clip_torch>=2.32.0   # CLIP/SigLIP 2 埋め込み（torch 必須）
+# scikit-learn>=1.4.0       # K-Means クラスタリング（numpyフォールバックあり）
+# umap-learn>=0.5.7         # UMAP 次元削減（Phase 3）
+# hdbscan>=0.8.40           # HDBSCAN クラスタリング（Phase 3）
+# hnswlib>=0.8.0            # 近似最近傍探索（Phase 2）
+# ollama>=0.4.0             # ローカルVLM（Qwen3-VL など）
+# pydantic>=2.5.0           # VLM 出力スキーマ検証
+# faster-whisper>=1.1.0     # 音声書き起こしタグ付け
+# scenedetect>=0.6.7        # シーン境界検出（スクラブプレビュー）
+# videohash                 # 動画重複検出（pHash）

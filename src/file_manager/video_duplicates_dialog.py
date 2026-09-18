@@ -36,6 +36,7 @@ except ImportError:
     send2trash = None
 
 from .video_duplicates import DuplicateGroup, find_duplicate_videos
+from .utils import silent_question, silent_information, silent_warning
 
 
 class VideoDuplicatesWorker(QObject):
@@ -258,13 +259,13 @@ class VideoDuplicatesDialog(QDialog):
                 items_to_delete.append(item)
 
         if not files_to_delete:
-            QMessageBox.information(self, "情報", "削除可能なファイルが選択されていません。")
+            silent_information(self, "情報", "削除可能なファイルが選択されていません。")
             return
 
         # 確認ダイアログ
-        reply = QMessageBox.question(
-            self, 
-            "確認", 
+        reply = silent_question(
+            self,
+            "確認",
             f"{len(files_to_delete)} 個のファイルを削除しますか？\n（可能な場合はゴミ箱へ移動します）",
             QMessageBox.Yes | QMessageBox.No
         )
@@ -302,9 +303,9 @@ class VideoDuplicatesDialog(QDialog):
 
         if failed_files:
             message = f"{deleted_count} 個のファイルを削除しました。\n\n削除に失敗したファイル:\n" + "\n".join(failed_files)
-            QMessageBox.warning(self, "一部失敗", message)
+            silent_warning(self, "一部失敗", message)
         else:
-            QMessageBox.information(self, "完了", f"{deleted_count} 個のファイルを削除しました。")
+            silent_information(self, "完了", f"{deleted_count} 個のファイルを削除しました。")
 
     def _move_to_trash(self, file_path: str) -> bool:
         """ファイルをゴミ箱に移動、または削除"""

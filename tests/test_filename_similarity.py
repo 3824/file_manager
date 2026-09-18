@@ -186,6 +186,48 @@ class TestFindSimilarFilenames:
             )
             assert len(results) >= 1
 
+    def test_recursive_search_skips_inaccessible_directories(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            file1 = Path(tmpdir) / "video_01.mp4"
+            file2 = Path(tmpdir) / "video_02.mp4"
+            file1.touch()
+            file2.touch()
+
+            def fake_walk(path, onerror=None):
+                if onerror:
+                    onerror(PermissionError("access denied"))
+                yield str(path), ["locked"], [file1.name, file2.name]
+
+            with monkeypatch.context() as scoped_patch:
+                scoped_patch.setattr("src.file_manager.filename_similarity.os.walk", fake_walk)
+                results = find_similar_filenames(
+                    tmpdir, recursive=True, similarity_threshold=0.7, min_group_size=2
+                )
+
+            assert len(results) == 1
+            assert {Path(path).name for path in results[0].files} == {
+                "video_01.mp4",
+                "video_02.mp4",
+            }
+
+    def test_non_recursive_search_returns_empty_when_directory_listing_fails(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            progress_values = []
+
+            def raise_permission_error(path):
+                raise PermissionError(f"cannot list {path}")
+
+            with monkeypatch.context() as scoped_patch:
+                scoped_patch.setattr("src.file_manager.filename_similarity.os.scandir", raise_permission_error)
+                results = find_similar_filenames(
+                    tmpdir,
+                    recursive=False,
+                    progress_callback=progress_values.append,
+                )
+
+            assert results == []
+            assert progress_values[-1] == 100
+
 
 class TestSizeSimilarity:
     """サイズ類似度計算のテスト"""

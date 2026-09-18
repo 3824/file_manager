@@ -5,7 +5,14 @@
 ### 1.1 現在の処理フロー
 
 ```
-ファイル選択 → VideoDigestWorker(QThread) → extract_video_features()
+ファイル選択
+  → 右ペインの `VideoThumbnailPreview`
+     → `VideoDigestWorker(QThread)` → `VideoDigestGenerator.generate_digest()`
+     → `extract_video_features()`
+  → コンテキストメニューの「動画ダイジェストを表示」
+     → `VideoDigestDialog`
+     → `VideoDigestWorker(QThread)` → `VideoDigestGenerator.generate_digest()`
+     → `extract_video_features()`
   → cv2.VideoCapture で動画を開く
   → 6フレームを順次シーク・デコード
   → 各フレームに対して:
@@ -34,6 +41,7 @@
 3. **フルデコード** — サムネイル用途でもフル解像度でデコードしている
 4. **特徴量計算が毎回走る** — ダイジェスト表示時に不要な特徴量（重複検出用）まで計算している
 5. **逐次処理** — 6フレームの抽出が直列で並列化されていない
+6. **設定キーが不統一** — `FileManagerWidget` は `video_thumbnail_count` 系、`VideoDigestDialog` は `max_thumbnails` 系を参照しており、設定が揃わない
 
 ## 2. 改善策
 
@@ -41,15 +49,15 @@
 
 #### 概要
 
-一度生成したサムネイルと特徴量をディスクキャッシュに保存し、2回目以降の表示を即座に行う。
+一度生成したサムネイルをディスクキャッシュに保存し、2回目以降の表示を即座に行う。
+特徴量キャッシュは将来拡張とし、初期導入では対象外にする。
 
 #### 技術方針
 
 - キャッシュキー: `SHA256(ファイルパス + ファイルサイズ + 更新日時)` のハッシュ値
   - ファイル内容のハッシュは大容量動画では遅すぎるため、メタデータベースとする
-- キャッシュ保存先: `%LOCALAPPDATA%/FileManager/cache/video_digest/`
+- キャッシュ保存先: `QStandardPaths.CacheLocation` 配下の `video_digest/`
 - サムネイル形式: JPEG（品質85、1枚あたり5-15KB）
-- 特徴量形式: NumPy `.npz`（圧縮、1動画あたり約2KB）
 - キャッシュサイズ上限: 設定可能（デフォルト200MB）、LRU方式で古いものから削除
 
 #### 想定インターフェース
@@ -73,14 +81,6 @@ class VideoDigestCache:
         """サムネイルをキャッシュに保存"""
         ...
 
-    def get_features(self, key: str) -> VideoFeatures | None:
-        """キャッシュ済み特徴量を取得（なければNone）"""
-        ...
-
-    def put_features(self, key: str, features: VideoFeatures) -> None:
-        """特徴量をキャッシュに保存"""
-        ...
-
     def evict_lru(self) -> None:
         """キャッシュサイズ上限を超えた場合にLRUで削除"""
         ...
@@ -89,7 +89,7 @@ class VideoDigestCache:
 #### 期待効果
 
 - 2回目以降の表示: **200-950ms → 5-20ms**（ディスクI/Oのみ）
-- 重複検出の特徴量計算も省略可能
+- サムネイル再表示をほぼ即時化できる
 
 ---
 
@@ -244,6 +244,10 @@ class ThumbnailMemoryCache:
         ...
 ```
 
+備考:
+- `VideoThumbnailPreview` は既に存在するため、新規ウィジェット追加ではなく既存クラス拡張として実装する
+- 右ペインのプレビューと `VideoDigestDialog` の双方で同じキャッシュを使い回せる構成にする
+
 #### 期待効果
 
 - 同一セッション内での再表示: **即時（0ms）**
@@ -278,7 +282,8 @@ class ThumbnailMemoryCache:
 | `src/file_manager/video_features.py` | `extract_thumbnails_only()` を追加、既存関数はそのまま残す |
 | `src/file_manager/video_digest.py` | サムネイル生成時に特徴量計算をスキップ、`thumbnail_ready` シグナル追加 |
 | `src/file_manager/video_digest_dialog.py` | プログレッシブ表示対応、1枚ずつグリッドに配置 |
-| `src/file_manager/video_thumbnail_preview.py` | メモリキャッシュ統合 |
+| `src/file_manager/video_thumbnail_preview.py` | 既存プレビューへメモリキャッシュ統合 |
+| `src/file_manager/file_manager.py` | 動画ダイジェスト設定キーの参照を統一 |
 
 #### 4.2 video_features.py の変更
 
@@ -347,13 +352,12 @@ class VideoDigestWorker(QThread):
 #### 4.6 キャッシュ構造
 
 ```
-%LOCALAPPDATA%/FileManager/cache/video_digest/
+{QStandardPaths.CacheLocation}/video_digest/
 ├── {hash_prefix}/
 │   ├── {full_hash}.meta.json    # メタ情報（パス、サイズ、日時、作成日）
 │   ├── {full_hash}_0.jpg        # サムネイル0
 │   ├── {full_hash}_1.jpg        # サムネイル1
 │   ├── ...
-│   └── {full_hash}.features.npz # 特徴量（オプション）
 └── cache_index.json             # LRU管理用インデックス
 ```
 
@@ -374,6 +378,7 @@ display_video() →
 - キャッシュ最大サイズ（MB）のスピンボックス
 - 「キャッシュをクリア」ボタン
 - 現在のキャッシュ使用量の表示
+- 既存の動画ダイジェスト設定キーを `video_thumbnail_count` / `video_thumbnail_width` / `video_thumbnail_height` に統一
 
 ### Phase 3: 低解像度デコード（C）
 
@@ -438,7 +443,6 @@ def extract_frames_ffmpeg(
 確認項目:
 - キャッシュキー生成が決定的（同一入力→同一キー）
 - サムネイルの保存・復元で画質劣化が許容範囲内
-- 特徴量の保存・復元で値が完全一致
 - LRU削除が上限超過時に正しく動作する
 - ファイル更新（タイムスタンプ変更）でキャッシュが無効化される
 - キャッシュディレクトリが存在しない場合に自動作成される
@@ -473,5 +477,6 @@ def extract_frames_ffmpeg(
 
 - Phase 1 は既存の公開インターフェース（`VideoFeatures`, `extract_video_features()`）を変更しない。新関数を追加する形で既存機能との互換性を維持する
 - 重複検出機能（`video_duplicates.py`）は引き続き `extract_video_features()` を使用し、特徴量をフル計算する
-- Phase 2 のディスクキャッシュは重複検出の特徴量もキャッシュ可能だが、初期実装ではサムネイルのみをキャッシュ対象とする
+- `VideoDigestDialog` と `FileManagerWidget` の動画ダイジェスト設定キーは実装時に統一する
+- Phase 2 のディスクキャッシュは初期実装ではサムネイルのみをキャッシュ対象とする
 - Phase 3 の ffmpeg はオプション依存。インストールガイドを設定画面のツールチップに記載する

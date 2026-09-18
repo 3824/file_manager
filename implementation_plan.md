@@ -1,46 +1,41 @@
-# Implementation Plan - Spec.md Updates
+# 実装計画 & ロードマップ (Implementation Plan)
 
-Based on `spec.md`, we need to enhance the existing `file_manager` implementation.
+本ドキュメントは、GUIファイラーの主要機能の実装状況と今後の拡張ロードマップをまとめたものです。
 
-## 1. Goal
-Implement requirements from `spec.md` that are currently missing or incomplete:
-1.  **Video Metadata Columns**: Display Duration, Resolution, FPS in the detailed view.
-2.  **Smart Preview**: Show video thumbnail digest on mouse hover.
-3.  **Drive Bar**: Ensure drive bar features (mostly implemented, will verify).
+---
 
-## 2. Proposed Changes
+## 1. 実装完了済み機能 (Completed)
 
-### 2.1 Video Metadata Columns (`src/file_manager/file_manager.py`)
-*   **Modify `CustomFileSystemModel`**:
-    *   Increase `columnCount` to support new columns: `Duration`, `Resolution`, `FPS`.
-    *   Update `headerData` to label new columns.
-    *   Add `metadata_cache` dictionary to store fetched video info.
-    *   In `data()`, checks cache for video files:
-        *   If cached: return value.
-        *   If not cached: return "..." and trigger an asynchronous fetch (using `QThreadPool` or `QThread`).
-*   **VideoInfoWorker**:
-    *   Create a worker/runnable that uses `VideoDigestGenerator.get_video_info` to fetch metadata without blocking the UI.
-    *   On completion, update cache and emit `dataChanged`.
+### 1.1 基本ファイル管理 & UI
+- [x] **2ペイン構成 (左ペイン: ドライブバー + フォルダツリー、右ペイン: ファイル一覧)**
+- [x] **表示モード切替 (詳細表示 / リスト表示 / アイコン表示)**
+- [x] **ファイル基本操作 (作成、リネーム、コピー、切り取り、貼り付け、ゴミ箱移動、完全削除)**
+- [x] **ソート & リアルタイム検索フィルター**
+- [x] **Fluent / Mica 対応モダンテーマ (ライト / ダークモード、システム連動)**
+- [x] **qtawesome によるベクターアイコン統一**
+- [x] **設定ダイアログ (一般・外観・列設定・ダイジェスト・翻訳) & QSettings 永続化**
 
-### 2.2 Smart Preview Integration (`src/file_manager/file_manager.py`)
-*   **Modify `FileManagerWidget`**:
-    *   Enable `setMouseTracking(True)` on views.
-    *   Connect `entered` signal of `QTreeView`/`QListView` (or implementation of custom hover delegate).
-    *   When hovering over a video file:
-        *   If `VideoThumbnailPreview` is not visible, show it (or use a floating window/tooltip style).
-        *   Call `self.thumbnail_preview.display_video(path)`.
-    *   *Decision*: For this iteration, we will use a **Floating Widget** or a fixed **Preview Pane** at the bottom/side that updates on hover/selection, as "popup" implementation can be complex with focus stealing. The current `VideoThumbnailPreview` widget is a good candidate for a preview pane.
+### 1.2 メディア & 動画機能
+- [x] **動画サムネイル非同期生成 & SQLite キャッシュ**
+- [x] **動画メタデータ (Duration, Resolution, FPS) 取得 & カラム表示**
+- [x] **動画ダイジェスト表示 (OpenCV による複数フレーム抽出・ポップアップ)**
+- [x] **動画ミニプレイヤー & ポップアップウィンドウ再生 (PySide6 QtMultimedia)**
+- [x] **動画クラスタリング機能 (映像特徴量抽出、SQLite キャッシュ、グルーピング)**
 
-### 2.3 Drive Bar & UI Refinements (`src/file_manager/file_manager.py`)
-*   Verify `LeftPaneWidget` properly handles drive selection and updates the view.
-*   Ensure `VideoThumbnailPreview` is properly instantiated and added to the layout (it looked initialized but maybe not added in the previous read).
+### 1.3 整理・分析・AI機能
+- [x] **ファイル名類似度検出 & グループ化整理ダイアログ**
+- [x] **同一ファイルサイズ検出 & 重複整理ダイアログ**
+- [x] **ファイル名多言語翻訳機能 (Ollama ローカル LLM / Google Cloud Translation API)**
+- [x] **翻訳プレビュー & 一括リネームダイアログ**
+- [x] **ディスク使用量分析 (円グラフ表示 & ドリルダウン探索)**
+- [x] **SQLite インデックス検索ダイアログ**
+- [x] **テストランナーダイアログ (`TestRunnerDialog`)**
 
-## 3. Verification Plan
-*   **Automated Tests**:
-    *   Create/Update `tests/test_file_manager_metadata.py` to test model column data and caching logic.
-    *   Verify `get_video_info` integration.
-*   **Manual Verification**:
-    *   Run `run.py`.
-    *   Navigate to a folder with videos.
-    *   Check if Duration/Resolution columns populate (eventually).
-    *   Hover over a video and check if thumbnails appear.
+---
+
+## 2. 今後の拡張予定 (Roadmap)
+
+- [ ] **タブ機能**: 複数フォルダをタブで切り替えて閲覧できる機能
+- [ ] **アーカイブ操作**: ZIP 等の圧縮・解凍のネイティブサポート
+- [ ] **高度なクラスタリング (Phase 2/3)**: OpenCLIP / SigLIP によるマルチモーダル埋め込み、HDBSCAN / UMAP による高度な動画分類
+- [ ] **音声書き起こしタグ付け**: faster-whisper と連携した動画内音声からの自動タグ付け

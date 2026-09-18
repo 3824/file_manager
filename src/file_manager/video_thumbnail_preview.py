@@ -5,11 +5,12 @@
 from __future__ import annotations
 
 import os
+from collections import OrderedDict
 from pathlib import Path
 from typing import Iterable, List, Optional
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -23,11 +24,13 @@ from PySide6.QtWidgets import (
 
 try:
     from .video_digest import VideoDigestWorker, VideoDigestGenerator, OPENCV_AVAILABLE
+    from .video_digest_cache import VideoDigestCache
 
     VIDEO_DIGEST_AVAILABLE = True
 except Exception:  # pragma: no cover - fallback when optional dependency missing
     VideoDigestWorker = None  # type: ignore
     VideoDigestGenerator = None  # type: ignore
+    VideoDigestCache = None  # type: ignore
     OPENCV_AVAILABLE = False
     VIDEO_DIGEST_AVAILABLE = False
 
@@ -41,6 +44,7 @@ class VideoThumbnailPreview(QWidget):
         *,
         max_thumbnails: int = 6,
         thumbnail_size: tuple[int, int] = (160, 90),
+        cache_size_mb: int = 200,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("video-thumbnail-preview")
@@ -53,6 +57,8 @@ class VideoThumbnailPreview(QWidget):
         self._active_token = 0
         self._token_counter = 0
         self._thumbnail_labels: List[QLabel] = []
+        self._thumbnail_cache = ThumbnailMemoryCache()
+        self._disk_cache = VideoDigestCache(max_size_mb=cache_size_mb) if VideoDigestCache else None
 
         self._build_ui()
         self.display_video(None)
@@ -72,6 +78,7 @@ class VideoThumbnailPreview(QWidget):
         layout.addWidget(self._title_label)
 
         frame = QFrame()
+        frame.setObjectName("thumbnail-card")
         frame.setFrameShape(QFrame.StyledPanel)
         frame_layout = QVBoxLayout(frame)
         frame_layout.setContentsMargins(8, 8, 8, 8)
@@ -82,9 +89,11 @@ class VideoThumbnailPreview(QWidget):
         frame_layout.addWidget(self._status_label)
 
         self._scroll_area = QScrollArea()
+        self._scroll_area.setObjectName("thumbnail-scroll-area")
         self._scroll_area.setWidgetResizable(True)
         self._scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self._scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._scroll_area.setFixedHeight(self._thumbnail_size[1] + 20)
 
         self._thumb_container = QWidget()
         self._thumb_layout = QHBoxLayout(self._thumb_container)
@@ -102,6 +111,7 @@ class VideoThumbnailPreview(QWidget):
         *,
         max_thumbnails: Optional[int] = None,
         thumbnail_size: Optional[tuple[int, int]] = None,
+        cache_size_mb: Optional[int] = None,
     ) -> None:
         """Update preferred thumbnail parameters and refresh if settings changed."""
         changed = False
@@ -130,7 +140,15 @@ class VideoThumbnailPreview(QWidget):
             sanitized_size = (width, height)
             if sanitized_size != self._thumbnail_size:
                 self._thumbnail_size = sanitized_size
+                self._scroll_area.setFixedHeight(self._thumbnail_size[1] + 20)
                 changed = True
+        if cache_size_mb is not None and self._disk_cache is not None:
+            try:
+                sanitized_cache_size = max(1, int(cache_size_mb))
+            except (TypeError, ValueError):
+                sanitized_cache_size = self._disk_cache.max_size_mb
+            if sanitized_cache_size != self._disk_cache.max_size_mb:
+                self._disk_cache.max_size_mb = sanitized_cache_size
         if changed and self._current_video:
             current = self._current_video
             self._current_video = None
@@ -160,6 +178,18 @@ class VideoThumbnailPreview(QWidget):
             self._show_message(f"{name} は動画ファイルではありません", clear_thumbnails=True)
             return
 
+        cache_key = self._cache_key(resolved)
+        cached_pixmaps = self._thumbnail_cache.get(cache_key)
+        if cached_pixmaps is not None:
+            self._handle_digest(token, resolved, cached_pixmaps)
+            return
+        if self._disk_cache is not None:
+            disk_key = self._disk_cache_key(resolved)
+            cached_pixmaps = self._disk_cache.get_thumbnails(disk_key)
+            if cached_pixmaps is not None:
+                self._handle_digest(token, resolved, cached_pixmaps)
+                return
+
         self._show_message("サムネイルを生成中です…", clear_thumbnails=True)
         self._start_worker(resolved, token)
 
@@ -187,6 +217,16 @@ class VideoThumbnailPreview(QWidget):
         self._status_label.setText(message)
         if clear_thumbnails:
             self._clear_thumbnails()
+
+    def _cache_key(self, video_path: str) -> str:
+        return f"{video_path}|{self._max_thumbnails}|{self._thumbnail_size[0]}x{self._thumbnail_size[1]}"
+
+    def _disk_cache_key(self, video_path: str) -> str:
+        if self._disk_cache is None:
+            return self._cache_key(video_path)
+        path = Path(video_path)
+        base_key = self._disk_cache.cache_key(path)
+        return f"{base_key}_{self._max_thumbnails}_{self._thumbnail_size[0]}x{self._thumbnail_size[1]}"
 
     def _clear_thumbnails(self) -> None:
         for label in self._thumbnail_labels:
@@ -223,17 +263,26 @@ class VideoThumbnailPreview(QWidget):
         suffix = f" {value}%" if value < 100 else ""
         self._status_label.setText(f"{name} のサムネイルを生成中…{suffix}")
 
-    def _handle_digest(self, token: int, video_path: str, pixmaps: Iterable[QPixmap]) -> None:
+    def _handle_digest(self, token: int, video_path: str, pixmaps: Iterable) -> None:
         if token != self._active_token:
             return
         if not self._current_video or Path(video_path).resolve() != Path(self._current_video).resolve():
             return
         self._clear_thumbnails()
         name = Path(video_path).name
-        pixmap_list = list(pixmaps)
+        # ワーカーは QImage を送出するため QPixmap に正規化する（QLabel.setPixmap は QPixmap 専用）
+        pixmap_list: list[QPixmap] = []
+        for p in pixmaps:
+            if isinstance(p, QImage):
+                pixmap_list.append(QPixmap.fromImage(p))
+            else:
+                pixmap_list.append(p)
         if not pixmap_list:
             self._status_label.setText(f"{name} のサムネイルを生成できませんでした")
             return
+        self._thumbnail_cache.put(self._cache_key(video_path), pixmap_list)
+        if self._disk_cache is not None:
+            self._disk_cache.put_thumbnails(self._disk_cache_key(video_path), pixmap_list)
         for pixmap in pixmap_list:
             label = QLabel()
             label.setAlignment(Qt.AlignCenter)
@@ -260,6 +309,27 @@ class VideoThumbnailPreview(QWidget):
     def _handle_finished(self, token: int) -> None:
         if token == self._active_token:
             self._worker = None
+
+
+class ThumbnailMemoryCache:
+    """動画サムネイルの簡易メモリキャッシュ。"""
+
+    def __init__(self, max_entries: int = 50) -> None:
+        self._cache: OrderedDict[str, list[QPixmap]] = OrderedDict()
+        self._max_entries = max_entries
+
+    def get(self, video_path: str) -> Optional[list[QPixmap]]:
+        cached = self._cache.get(video_path)
+        if cached is None:
+            return None
+        self._cache.move_to_end(video_path)
+        return list(cached)
+
+    def put(self, video_path: str, thumbnails: list[QPixmap]) -> None:
+        self._cache[video_path] = list(thumbnails)
+        self._cache.move_to_end(video_path)
+        while len(self._cache) > self._max_entries:
+            self._cache.popitem(last=False)
 
 
 __all__ = ["VideoThumbnailPreview", "VIDEO_DIGEST_AVAILABLE", "OPENCV_AVAILABLE"]

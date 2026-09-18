@@ -9,7 +9,7 @@ import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Callable, List, Optional, Sequence
+from typing import Callable, Iterable, List, Optional, Sequence
 
 ProgressCallback = Optional[Callable[[int], None]]
 StopCallback = Optional[Callable[[], bool]]
@@ -177,11 +177,41 @@ def extract_number_pattern(filename: str) -> tuple[str, list[int]]:
 
 def is_video_file(path: Path, extensions: Sequence[str] | None = None) -> bool:
     """動画拡張子かどうかを判定"""
-    if not path.is_file():
+    try:
+        if not path.is_file():
+            return False
+    except OSError:
         return False
     suffix = path.suffix.lower()
     target_exts = tuple(e.lower() for e in (extensions or DEFAULT_VIDEO_EXTENSIONS))
     return suffix in target_exts
+
+
+def _is_existing_directory(path: Path) -> bool:
+    try:
+        return path.exists() and path.is_dir()
+    except OSError:
+        return False
+
+
+def _iter_file_paths(base_dir: Path, recursive: bool) -> Iterable[Path]:
+    if recursive:
+        for root, _dirnames, filenames in os.walk(base_dir, onerror=lambda _error: None):
+            root_path = Path(root)
+            for filename in filenames:
+                yield root_path / filename
+        return
+
+    try:
+        with os.scandir(base_dir) as entries:
+            for entry in entries:
+                try:
+                    if entry.is_file():
+                        yield Path(entry.path)
+                except OSError:
+                    continue
+    except OSError:
+        return
 
 
 def find_similar_filenames(
@@ -221,16 +251,14 @@ def find_similar_filenames(
     if stop_callback and stop_callback():
         return []
 
-    if not base_dir.exists() or not base_dir.is_dir():
+    if not _is_existing_directory(base_dir):
         if progress_callback:
             progress_callback(100)
         return []
 
     # ファイル一覧の収集
     files: List[Path] = []
-    iterator = base_dir.rglob("*") if recursive else base_dir.iterdir()
-
-    for path in iterator:
+    for path in _iter_file_paths(base_dir, recursive):
         if stop_callback and stop_callback():
             if progress_callback:
                 progress_callback(100)
@@ -241,10 +269,10 @@ def find_similar_filenames(
             if is_video_file(path):
                 files.append(path)
         # 指定された拡張子のファイルを対象とする場合
-        elif path.is_file() and path.suffix.lower() in [e.lower() for e in extensions]:
+        elif path.suffix.lower() in [e.lower() for e in extensions]:
             files.append(path)
         # 拡張子指定なし（空リスト）の場合は全ファイル
-        elif extensions == [] and path.is_file():
+        elif extensions == []:
             files.append(path)
 
     if not files:
